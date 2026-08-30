@@ -3,13 +3,19 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
+#ifndef ZIGBEE_MODE_ED
+#error "SkimmerSense must be built in Zigbee End Device mode"
+#endif
+
+#include "Zigbee.h"
+
 // SkimmerSense prototype pinout for Seeed Studio XIAO ESP32-C6
-// D0 / GPIO0  -> low-level float switch
-// D1 / GPIO1  -> high-level float switch
-// D2 / GPIO2  -> switched power for DS18B20
-// D3 / GPIO21 -> DS18B20 1-Wire data
-// D4 / GPIO22 -> MAX17048 SDA
-// D5 / GPIO23 -> MAX17048 SCL
+// D0 -> low-level float switch
+// D1 -> high-level float switch
+// D2 -> switched power for DS18B20
+// D3 -> DS18B20 1-Wire data
+// D4 -> MAX17048 SDA
+// D5 -> MAX17048 SCL
 
 static constexpr uint8_t PIN_FLOAT_LOW = D0;
 static constexpr uint8_t PIN_FLOAT_HIGH = D1;
@@ -17,8 +23,13 @@ static constexpr uint8_t PIN_DS18B20_POWER = D2;
 static constexpr uint8_t PIN_DS18B20_DATA = D3;
 static constexpr uint8_t PIN_I2C_SDA = D4;
 static constexpr uint8_t PIN_I2C_SCL = D5;
+static constexpr uint8_t PIN_FACTORY_RESET = BOOT_PIN;
 
 static constexpr uint8_t MAX17048_I2C_ADDRESS = 0x36;
+
+static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
+static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
+static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
 
 static constexpr uint32_t TEMP_INTERVAL_MS = 10000;
 static constexpr uint32_t FLOAT_DEBOUNCE_MS = 50;
@@ -26,6 +37,10 @@ static constexpr uint32_t MAX17048_CHECK_INTERVAL_MS = 30000;
 
 OneWire oneWire(PIN_DS18B20_DATA);
 DallasTemperature temperatureSensors(&oneWire);
+
+ZigbeeTempSensor zbTemperature(ZB_EP_TEMPERATURE);
+ZigbeeBinary zbLowLevel(ZB_EP_LOW_LEVEL);
+ZigbeeBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
 
 bool lastLowRaw = HIGH;
 bool lastHighRaw = HIGH;
@@ -57,13 +72,12 @@ void reportMax17048(bool force = false) {
     Serial.println("MAX17048: detected on I2C address 0x36");
   } else {
     Serial.println("MAX17048: no response on I2C address 0x36");
-    Serial.println("  This is expected while no battery is connected on an Adafruit-style MAX17048 breakout.");
+    Serial.println("  Expected until the battery is connected.");
   }
 }
 
 float readWaterTemperatureC() {
-  // The DS18B20 pull-up resistor must be connected between
-  // PIN_DS18B20_POWER (V) and PIN_DS18B20_DATA (S).
+  // The DS18B20 pull-up resistor is between D2 (V) and D3 (DATA).
   pinMode(PIN_DS18B20_POWER, OUTPUT);
   digitalWrite(PIN_DS18B20_POWER, HIGH);
   delay(20);
@@ -88,20 +102,132 @@ float readWaterTemperatureC() {
   return temperatureC;
 }
 
-void printFloatStates() {
-  const bool lowRaw = digitalRead(PIN_FLOAT_LOW);
-  const bool highRaw = digitalRead(PIN_FLOAT_HIGH);
+void publishLowFloat(bool rawState, bool force = false) {
+  static bool initialized = false;
+  static bool lastPublishedClosed = false;
+  const bool closed = rawState == LOW;
 
-  Serial.printf(
-      "Float switches | LOW: %s | HIGH: %s\n",
-      contactState(lowRaw),
-      contactState(highRaw));
+  if (!force && initialized && closed == lastPublishedClosed) {
+    return;
+  }
+
+  initialized = true;
+  lastPublishedClosed = closed;
+
+  zbLowLevel.setBinaryInput(closed);
+  if (Zigbee.connected()) {
+    zbLowLevel.reportBinaryInput();
+  }
+}
+
+void publishHighFloat(bool rawState, bool force = false) {
+  static bool initialized = false;
+  static bool lastPublishedClosed = false;
+  const bool closed = rawState == LOW;
+
+  if (!force && initialized && closed == lastPublishedClosed) {
+    return;
+  }
+
+  initialized = true;
+  lastPublishedClosed = closed;
+
+  zbHighLevel.setBinaryInput(closed);
+  if (Zigbee.connected()) {
+    zbHighLevel.reportBinaryInput();
+  }
+}
+
+void publishTemperature(float temperatureC) {
+  if (temperatureC == DEVICE_DISCONNECTED_C) {
+    Serial.println("DS18B20: not detected");
+    return;
+  }
+
+  Serial.printf("Water temperature: %.2f C\n", temperatureC);
+  zbTemperature.setTemperature(temperatureC);
+
+  if (Zigbee.connected()) {
+    zbTemperature.reportTemperature();
+  }
+}
+
+void configureZigbeeEndpoints() {
+  // Temperature endpoint.
+  zbTemperature.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
+  zbTemperature.setMinMaxValue(-10, 60);
+  zbTemperature.setDefaultValue(20.0);
+  zbTemperature.setTolerance(1);
+
+  // Two standard Zigbee Binary Input endpoints. Zigbee2MQTT can generate
+  // definitions from the genBinaryInput cluster and uses these descriptions.
+  zbLowLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
+  zbLowLevel.addBinaryInput();
+  zbLowLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
+  zbLowLevel.setBinaryInputDescription("Low Level");
+
+  zbHighLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
+  zbHighLevel.addBinaryInput();
+  zbHighLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
+  zbHighLevel.setBinaryInputDescription("High Level");
+
+  Zigbee.addEndpoint(&zbTemperature);
+  Zigbee.addEndpoint(&zbLowLevel);
+  Zigbee.addEndpoint(&zbHighLevel);
+}
+
+void startZigbee() {
+  Serial.println();
+  Serial.println("Starting Zigbee End Device...");
+  Serial.println("Open 'Permit join' in Zigbee2MQTT if this is the first pairing.");
+
+  if (!Zigbee.begin()) {
+    Serial.println("Zigbee failed to start. Rebooting in 2 seconds...");
+    delay(2000);
+    ESP.restart();
+  }
+
+  Serial.print("Waiting for Zigbee network");
+  while (!Zigbee.connected()) {
+    Serial.print(".");
+    delay(250);
+  }
+  Serial.println();
+  Serial.println("Zigbee connected!");
+
+  // Configure temperature reporting after the stack has started.
+  // For bring-up, report at least every 10 seconds or after a temperature change.
+  zbTemperature.setReporting(1, 10, 1);
+
+  publishLowFloat(digitalRead(PIN_FLOAT_LOW), true);
+  publishHighFloat(digitalRead(PIN_FLOAT_HIGH), true);
+  publishTemperature(readWaterTemperatureC());
+}
+
+void handleFactoryResetButton() {
+  if (digitalRead(PIN_FACTORY_RESET) != LOW) {
+    return;
+  }
+
+  delay(100);
+  const uint32_t pressedAt = millis();
+
+  while (digitalRead(PIN_FACTORY_RESET) == LOW) {
+    if (millis() - pressedAt > 3000) {
+      Serial.println("Factory-resetting Zigbee network data...");
+      delay(500);
+      Zigbee.factoryReset();
+      return;
+    }
+    delay(20);
+  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1200);
 
+  pinMode(PIN_FACTORY_RESET, INPUT_PULLUP);
   pinMode(PIN_FLOAT_LOW, INPUT_PULLUP);
   pinMode(PIN_FLOAT_HIGH, INPUT_PULLUP);
 
@@ -117,47 +243,36 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" SkimmerSense - hardware bring-up v0.1");
-  Serial.println(" XIAO ESP32-C6 / USB test firmware");
+  Serial.println(" SkimmerSense v0.2 - Zigbee bring-up");
+  Serial.println(" XIAO ESP32-C6 / Zigbee End Device");
   Serial.println("========================================");
-  Serial.println();
-  Serial.println("Pinout:");
-  Serial.println("  D0 -> LOW float -> GND");
-  Serial.println("  D1 -> HIGH float -> GND");
-  Serial.println("  D2 -> DS18B20 V (switched 3.3 V)");
-  Serial.println("  D3 -> DS18B20 S / DATA");
-  Serial.println("  D4 -> MAX17048 SDA");
-  Serial.println("  D5 -> MAX17048 SCL");
-  Serial.println();
-
-  Serial.println("A closed float contact reads LOW because INPUT_PULLUP is enabled.");
-  printFloatStates();
-
-  const float temperatureC = readWaterTemperatureC();
-  if (temperatureC == DEVICE_DISCONNECTED_C) {
-    Serial.println("DS18B20: not detected");
-  } else {
-    Serial.printf("Water temperature: %.2f C\n", temperatureC);
-  }
+  Serial.printf("Float LOW : %s\n", contactState(lastLowRaw));
+  Serial.printf("Float HIGH: %s\n", contactState(lastHighRaw));
 
   reportMax17048(true);
+
+  configureZigbeeEndpoints();
+  startZigbee();
 
   lastTemperatureMs = millis();
   lastMax17048CheckMs = millis();
 
   Serial.println();
-  Serial.println("Ready. Move each float switch by hand and watch the serial output.");
-  Serial.println("Temperature is sampled every 10 seconds during bring-up.");
+  Serial.println("SkimmerSense is online.");
+  Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
 }
 
 void loop() {
   const uint32_t now = millis();
+
+  handleFactoryResetButton();
 
   const bool lowRaw = digitalRead(PIN_FLOAT_LOW);
   if (lowRaw != lastLowRaw && now - lastLowChangeMs >= FLOAT_DEBOUNCE_MS) {
     lastLowRaw = lowRaw;
     lastLowChangeMs = now;
     Serial.printf("LOW-level float changed: %s\n", contactState(lowRaw));
+    publishLowFloat(lowRaw);
   }
 
   const bool highRaw = digitalRead(PIN_FLOAT_HIGH);
@@ -165,17 +280,12 @@ void loop() {
     lastHighRaw = highRaw;
     lastHighChangeMs = now;
     Serial.printf("HIGH-level float changed: %s\n", contactState(highRaw));
+    publishHighFloat(highRaw);
   }
 
   if (now - lastTemperatureMs >= TEMP_INTERVAL_MS) {
     lastTemperatureMs = now;
-
-    const float temperatureC = readWaterTemperatureC();
-    if (temperatureC == DEVICE_DISCONNECTED_C) {
-      Serial.println("DS18B20: not detected");
-    } else {
-      Serial.printf("Water temperature: %.2f C\n", temperatureC);
-    }
+    publishTemperature(readWaterTemperatureC());
   }
 
   if (now - lastMax17048CheckMs >= MAX17048_CHECK_INTERVAL_MS) {
