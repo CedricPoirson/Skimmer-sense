@@ -9,7 +9,7 @@
 
 #include "Zigbee.h"
 
-// SkimmerSense prototype pinout for Seeed Studio XIAO ESP32-C6
+// SkimmerSense pinout for Seeed Studio XIAO ESP32-C6
 // D0 -> low-level float switch
 // D1 -> high-level float switch
 // D2 -> switched power for DS18B20
@@ -25,17 +25,22 @@ static constexpr uint8_t PIN_I2C_SDA = D4;
 static constexpr uint8_t PIN_I2C_SCL = D5;
 static constexpr uint8_t PIN_FACTORY_RESET = BOOT_PIN;
 
+// MAX17048
 static constexpr uint8_t MAX17048_I2C_ADDRESS = 0x36;
+static constexpr uint8_t MAX17048_REG_VCELL = 0x02;
+static constexpr uint8_t MAX17048_REG_SOC = 0x04;
+static constexpr uint8_t MAX17048_REG_VERSION = 0x08;
+static constexpr uint8_t MAX17048_REG_CRATE = 0x16;
 
+// Zigbee endpoints
 static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
 static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
 static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
 
-// During USB/Zigbee validation, sample the pool temperature once per minute.
-// The production battery build will use a much longer interval with deep sleep.
+// Validation timings. Production battery firmware will use deep sleep.
 static constexpr uint32_t TEMP_INTERVAL_MS = 60UL * 1000UL;
 static constexpr uint32_t FLOAT_DEBOUNCE_MS = 50;
-static constexpr uint32_t MAX17048_CHECK_INTERVAL_MS = 30000;
+static constexpr uint32_t MAX17048_CHECK_INTERVAL_MS = 30UL * 1000UL;
 
 OneWire oneWire(PIN_DS18B20_DATA);
 DallasTemperature temperatureSensors(&oneWire);
@@ -46,7 +51,6 @@ ZigbeeBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
 
 bool lastLowRaw = HIGH;
 bool lastHighRaw = HIGH;
-bool lastMax17048Present = false;
 uint32_t lastLowChangeMs = 0;
 uint32_t lastHighChangeMs = 0;
 uint32_t lastTemperatureMs = 0;
@@ -61,21 +65,61 @@ bool i2cDevicePresent(uint8_t address) {
   return Wire.endTransmission() == 0;
 }
 
-void reportMax17048(bool force = false) {
-  const bool present = i2cDevicePresent(MAX17048_I2C_ADDRESS);
+bool readMax17048Register16(uint8_t reg, uint16_t &value) {
+  Wire.beginTransmission(MAX17048_I2C_ADDRESS);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
 
-  if (!force && present == lastMax17048Present) {
+  if (Wire.requestFrom(MAX17048_I2C_ADDRESS, static_cast<uint8_t>(2)) != 2) {
+    return false;
+  }
+
+  value = (static_cast<uint16_t>(Wire.read()) << 8) |
+          static_cast<uint16_t>(Wire.read());
+  return true;
+}
+
+void reportMax17048() {
+  if (!i2cDevicePresent(MAX17048_I2C_ADDRESS)) {
+    Serial.println("MAX17048: no response on I2C address 0x36");
     return;
   }
 
-  lastMax17048Present = present;
-
-  if (present) {
-    Serial.println("MAX17048: detected on I2C address 0x36");
-  } else {
-    Serial.println("MAX17048: no response on I2C address 0x36");
-    Serial.println("  Expected until the battery is connected.");
+  uint16_t version = 0;
+  if (!readMax17048Register16(MAX17048_REG_VERSION, version)) {
+    Serial.println("MAX17048: I2C ACK, but VERSION register read failed");
+    return;
   }
+
+  Serial.printf("MAX17048: I2C ACK | VERSION=0x%04X\n", version);
+
+  // Adafruit's reference driver considers the device ready only when
+  // (VERSION & 0xFFF0) == 0x0010. Without a battery it may read 0xFFFF.
+  if ((version & 0xFFF0) != 0x0010) {
+    Serial.println("MAX17048: gauge not ready (battery probably not connected)");
+    return;
+  }
+
+  uint16_t rawVcell = 0;
+  uint16_t rawSoc = 0;
+  uint16_t rawCrate = 0;
+
+  if (!readMax17048Register16(MAX17048_REG_VCELL, rawVcell) ||
+      !readMax17048Register16(MAX17048_REG_SOC, rawSoc) ||
+      !readMax17048Register16(MAX17048_REG_CRATE, rawCrate)) {
+    Serial.println("MAX17048: telemetry register read failed");
+    return;
+  }
+
+  const float voltage = static_cast<float>(rawVcell) * 78.125f / 1000000.0f;
+  const float soc = static_cast<float>(rawSoc) / 256.0f;
+  const float chargeRate = static_cast<float>(static_cast<int16_t>(rawCrate)) * 0.208f;
+
+  Serial.printf(
+      "MAX17048 | voltage: %.3f V | SOC: %.1f %% | rate: %.2f %%/h\n",
+      voltage, soc, chargeRate);
 }
 
 float readWaterTemperatureC() {
@@ -155,14 +199,11 @@ void publishTemperature(float temperatureC) {
 }
 
 void configureZigbeeEndpoints() {
-  // Temperature endpoint.
   zbTemperature.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   zbTemperature.setMinMaxValue(-10, 60);
   zbTemperature.setDefaultValue(20.0);
   zbTemperature.setTolerance(1);
 
-  // Two standard Zigbee Binary Input endpoints. Zigbee2MQTT can generate
-  // definitions from the genBinaryInput cluster and uses these descriptions.
   zbLowLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   zbLowLevel.addBinaryInput();
   zbLowLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
@@ -197,7 +238,6 @@ void startZigbee() {
   Serial.println();
   Serial.println("Zigbee connected!");
 
-  // During validation, report at least once per minute or after a temperature change.
   zbTemperature.setReporting(1, 60, 1);
 
   publishLowFloat(digitalRead(PIN_FLOAT_LOW), true);
@@ -244,13 +284,13 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" SkimmerSense v0.3 - Zigbee validation");
+  Serial.println(" SkimmerSense v0.4 - MAX17048 telemetry");
   Serial.println(" XIAO ESP32-C6 / Zigbee End Device");
   Serial.println("========================================");
   Serial.printf("Float LOW : %s\n", contactState(lastLowRaw));
   Serial.printf("Float HIGH: %s\n", contactState(lastHighRaw));
 
-  reportMax17048(true);
+  reportMax17048();
 
   configureZigbeeEndpoints();
   startZigbee();
@@ -261,6 +301,7 @@ void setup() {
   Serial.println();
   Serial.println("SkimmerSense is online.");
   Serial.println("Temperature interval: 60 seconds (test mode).");
+  Serial.println("MAX17048 telemetry interval: 30 seconds.");
   Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
 }
 
@@ -292,7 +333,7 @@ void loop() {
 
   if (now - lastMax17048CheckMs >= MAX17048_CHECK_INTERVAL_MS) {
     lastMax17048CheckMs = now;
-    reportMax17048(false);
+    reportMax17048();
   }
 
   delay(10);
