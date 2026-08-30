@@ -31,7 +31,9 @@ static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
 static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
 static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
 
-static constexpr uint32_t TEMP_INTERVAL_MS = 10000;
+// During USB/Zigbee validation, sample the pool temperature once per minute.
+// The production battery build will use a much longer interval with deep sleep.
+static constexpr uint32_t TEMP_INTERVAL_MS = 60UL * 1000UL;
 static constexpr uint32_t FLOAT_DEBOUNCE_MS = 50;
 static constexpr uint32_t MAX17048_CHECK_INTERVAL_MS = 30000;
 
@@ -195,9 +197,8 @@ void startZigbee() {
   Serial.println();
   Serial.println("Zigbee connected!");
 
-  // Configure temperature reporting after the stack has started.
-  // For bring-up, report at least every 10 seconds or after a temperature change.
-  zbTemperature.setReporting(1, 10, 1);
+  // During validation, report at least once per minute or after a temperature change.
+  zbTemperature.setReporting(1, 60, 1);
 
   publishLowFloat(digitalRead(PIN_FLOAT_LOW), true);
   publishHighFloat(digitalRead(PIN_FLOAT_HIGH), true);
@@ -243,7 +244,7 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" SkimmerSense v0.2 - Zigbee bring-up");
+  Serial.println(" SkimmerSense v0.3 - Zigbee validation");
   Serial.println(" XIAO ESP32-C6 / Zigbee End Device");
   Serial.println("========================================");
   Serial.printf("Float LOW : %s\n", contactState(lastLowRaw));
@@ -259,6 +260,7 @@ void setup() {
 
   Serial.println();
   Serial.println("SkimmerSense is online.");
+  Serial.println("Temperature interval: 60 seconds (test mode).");
   Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
 }
 
