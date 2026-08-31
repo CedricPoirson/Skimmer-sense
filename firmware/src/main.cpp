@@ -33,6 +33,15 @@ static constexpr uint8_t MAX17048_REG_VCELL = 0x02;
 static constexpr uint8_t MAX17048_REG_SOC = 0x04;
 static constexpr uint8_t MAX17048_REG_VERSION = 0x08;
 static constexpr uint8_t MAX17048_REG_CRATE = 0x16;
+static constexpr uint8_t MAX17048_REG_STATUS = 0x1A;
+
+// STATUS register bits (first byte at address 0x1A).
+static constexpr uint8_t MAX17048_STATUS_SC = 0x20;  // SOC changed by 1%
+static constexpr uint8_t MAX17048_STATUS_HD = 0x10;  // SOC low
+static constexpr uint8_t MAX17048_STATUS_VR = 0x08;  // voltage reset
+static constexpr uint8_t MAX17048_STATUS_VL = 0x04;  // voltage low
+static constexpr uint8_t MAX17048_STATUS_VH = 0x02;  // voltage high
+static constexpr uint8_t MAX17048_STATUS_RI = 0x01;  // reset indicator
 
 // Zigbee endpoints
 static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
@@ -88,6 +97,40 @@ bool readMax17048Register16(uint8_t reg, uint16_t &value) {
   return true;
 }
 
+void printMax17048Status(uint8_t status) {
+  Serial.printf("MAX17048 STATUS=0x%02X |", status);
+
+  bool any = false;
+  if (status & MAX17048_STATUS_SC) {
+    Serial.print(" SC(SOC change)");
+    any = true;
+  }
+  if (status & MAX17048_STATUS_HD) {
+    Serial.print(" HD(SOC low)");
+    any = true;
+  }
+  if (status & MAX17048_STATUS_VR) {
+    Serial.print(" VR(voltage reset)");
+    any = true;
+  }
+  if (status & MAX17048_STATUS_VL) {
+    Serial.print(" VL(voltage low)");
+    any = true;
+  }
+  if (status & MAX17048_STATUS_VH) {
+    Serial.print(" VH(voltage high)");
+    any = true;
+  }
+  if (status & MAX17048_STATUS_RI) {
+    Serial.print(" RI(reset indicator)");
+    any = true;
+  }
+  if (!any) {
+    Serial.print(" no alert cause flags");
+  }
+  Serial.println();
+}
+
 void reportMax17048() {
   Serial.printf("MAX17048 INT: %s\n", max17048IntState(digitalRead(PIN_MAX17048_INT)));
 
@@ -103,6 +146,14 @@ void reportMax17048() {
   }
 
   Serial.printf("MAX17048: I2C ACK | VERSION=0x%04X\n", version);
+
+  uint16_t rawStatus = 0;
+  if (readMax17048Register16(MAX17048_REG_STATUS, rawStatus)) {
+    const uint8_t status = static_cast<uint8_t>(rawStatus >> 8);
+    printMax17048Status(status);
+  } else {
+    Serial.println("MAX17048: STATUS register read failed");
+  }
 
   // Adafruit's reference driver considers the device ready only when
   // (VERSION & 0xFFF0) == 0x0010. Without a battery it may read 0xFFFF.
@@ -296,7 +347,7 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" SkimmerSense v0.5 - MAX17048 INT test");
+  Serial.println(" SkimmerSense v0.6 - MAX17048 alert decode");
   Serial.println(" XIAO ESP32-C6 / Zigbee End Device");
   Serial.println("========================================");
   Serial.printf("Float LOW : %s\n", contactState(lastLowRaw));
@@ -315,7 +366,7 @@ void setup() {
   Serial.println("SkimmerSense is online.");
   Serial.println("Temperature interval: 60 seconds (test mode).");
   Serial.println("MAX17048 telemetry interval: 30 seconds.");
-  Serial.println("MAX17048 INT diagnostic enabled on GPIO4 / MTMS.");
+  Serial.println("MAX17048 INT/STATUS diagnostic enabled.");
   Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
 }
 
