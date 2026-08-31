@@ -14,23 +14,39 @@
 #error "SkimmerSense deep-sleep build requires EXT1 per-pin wake levels"
 #endif
 
-#ifndef SKIMMERSENSE_SLEEP_SECONDS
-#define SKIMMERSENSE_SLEEP_SECONDS 60ULL
+#ifndef SKIMMERSENSE_NORMAL_TIMER_SECONDS
+#define SKIMMERSENSE_NORMAL_TIMER_SECONDS 60ULL
+#endif
+
+#ifndef SKIMMERSENSE_LOW_CONFIRM_SECONDS
+#define SKIMMERSENSE_LOW_CONFIRM_SECONDS 30ULL
+#endif
+
+#ifndef SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS
+#define SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS 60ULL
 #endif
 
 #ifndef SKIMMERSENSE_ZIGBEE_WAIT_MS
 #define SKIMMERSENSE_ZIGBEE_WAIT_MS 10000UL
 #endif
 
-#ifndef SKIMMERSENSE_REPORT_SETTLE_MS
-#define SKIMMERSENSE_REPORT_SETTLE_MS 1500UL
+#ifndef SKIMMERSENSE_ZIGBEE_IDLE_MS
+#define SKIMMERSENSE_ZIGBEE_IDLE_MS 8000UL
+#endif
+
+#ifndef SKIMMERSENSE_BETWEEN_REPORTS_MS
+#define SKIMMERSENSE_BETWEEN_REPORTS_MS 400UL
+#endif
+
+#ifndef SKIMMERSENSE_POST_REPORT_WAIT_MS
+#define SKIMMERSENSE_POST_REPORT_WAIT_MS 2000UL
 #endif
 
 #include "Zigbee.h"
+#include "zcl/esp_zigbee_zcl_power_config.h"
 
-static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-test";
+static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
 
-// Seeed Studio XIAO ESP32-C6 pinout.
 static constexpr uint8_t PIN_FLOAT_LOW = D0;       // GPIO0, reed to GND
 static constexpr uint8_t PIN_FLOAT_HIGH = D1;      // GPIO1, reed to GND
 static constexpr uint8_t PIN_DS18B20_POWER = D2;
@@ -38,9 +54,7 @@ static constexpr uint8_t PIN_DS18B20_DATA = D3;
 static constexpr uint8_t PIN_I2C_SDA = D4;
 static constexpr uint8_t PIN_I2C_SCL = D5;
 static constexpr uint8_t PIN_MAX17048_INT = 4;     // GPIO4 / MTMS -> ALRT/INT
-static constexpr uint8_t PIN_FACTORY_RESET = BOOT_PIN;
 
-// MAX17048 registers.
 static constexpr uint8_t MAX17048_I2C_ADDRESS = 0x36;
 static constexpr uint8_t MAX17048_REG_VCELL = 0x02;
 static constexpr uint8_t MAX17048_REG_SOC = 0x04;
@@ -50,52 +64,113 @@ static constexpr uint8_t MAX17048_REG_STATUS = 0x1A;
 static constexpr uint16_t MAX17048_CONFIG_ALRT = 0x0020;
 static constexpr uint8_t MAX17048_STATUS_RI = 0x01;
 
-// Keep the existing endpoint layout unchanged.
 static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
 static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
 static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
 
+static constexpr uint32_t RTC_MAGIC = 0x534B4D31UL;  // "SKM1"
+
+enum class LevelState : uint8_t {
+  NORMAL = 0,
+  LOW_PENDING = 1,
+  WAIT_HIGH = 2,
+};
+
+RTC_DATA_ATTR uint32_t rtcMagic = 0;
+RTC_DATA_ATTR uint8_t rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
+
 OneWire oneWire(PIN_DS18B20_DATA);
 DallasTemperature temperatureSensors(&oneWire);
 
-ZigbeeTempSensor zbTemperature(ZB_EP_TEMPERATURE);
-ZigbeeBinary zbLowLevel(ZB_EP_LOW_LEVEL);
-ZigbeeBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
+class PreloadBinary : public ZigbeeBinary {
+ public:
+  explicit PreloadBinary(uint8_t endpoint) : ZigbeeBinary(endpoint) {}
 
-struct Max17048Telemetry {
-  bool valid = false;
-  uint16_t version = 0;
-  float voltage = 0.0f;
-  float soc = 0.0f;
+  bool preloadBinaryInput(bool value) {
+    esp_zb_attribute_list_t *cluster = esp_zb_cluster_list_get_cluster(
+        _cluster_list,
+        ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    if (cluster == nullptr) {
+      return false;
+    }
+    return esp_zb_cluster_update_attr(
+               cluster,
+               ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+               &value) == ESP_OK;
+  }
 };
 
-const char *contactState(bool rawState) {
-  return rawState == LOW ? "CLOSED" : "OPEN";
+ZigbeeTempSensor zbTemperature(ZB_EP_TEMPERATURE);
+PreloadBinary zbLowLevel(ZB_EP_LOW_LEVEL);
+PreloadBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
+
+struct SensorSnapshot {
+  bool lowClosed = false;
+  bool highClosed = false;
+  bool maxIntLow = false;
+  bool batteryValid = false;
+  uint16_t maxVersion = 0;
+  float batteryVoltage = 0.0f;
+  float batterySocRaw = 0.0f;
+  uint8_t batteryPercent = 100;
+  uint8_t batteryVoltageZcl = 40;
+  bool temperatureValid = false;
+  float waterTemperatureC = 20.0f;
+};
+
+struct CyclePlan {
+  LevelState nextState = LevelState::NORMAL;
+  bool useZigbee = false;
+  bool reportTemperature = false;
+  bool reportFloats = false;
+  uint64_t sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+  bool watchLow = false;
+  bool watchHigh = false;
+  bool watchMax = false;
+  const char *reason = "normal";
+};
+
+const char *stateName(LevelState state) {
+  switch (state) {
+    case LevelState::NORMAL: return "NORMAL";
+    case LevelState::LOW_PENDING: return "LOW_PENDING";
+    case LevelState::WAIT_HIGH: return "WAIT_HIGH";
+    default: return "UNKNOWN";
+  }
+}
+
+const char *contactState(bool closed) {
+  return closed ? "CLOSED" : "OPEN";
 }
 
 const char *wakeCauseName(esp_sleep_wakeup_cause_t cause) {
   switch (cause) {
-    case ESP_SLEEP_WAKEUP_EXT1: return "EXT1 GPIO";
     case ESP_SLEEP_WAKEUP_TIMER: return "timer";
+    case ESP_SLEEP_WAKEUP_EXT1: return "EXT1 GPIO";
     case ESP_SLEEP_WAKEUP_UNDEFINED: return "cold boot/reset";
     default: return "other";
   }
 }
 
 void releaseRtcWakePins() {
-  // EXT1 can leave RTC pad configuration active across deep-sleep reset.
-  // Return the three wake pins to normal GPIO control before Arduino pinMode().
   rtc_gpio_deinit(static_cast<gpio_num_t>(PIN_FLOAT_LOW));
   rtc_gpio_deinit(static_cast<gpio_num_t>(PIN_FLOAT_HIGH));
   rtc_gpio_deinit(static_cast<gpio_num_t>(PIN_MAX17048_INT));
 }
 
+uint64_t currentExt1Mask() {
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) {
+    return 0;
+  }
+  return esp_sleep_get_ext1_wakeup_status();
+}
+
 void printWakeReason() {
   const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   Serial.printf("Wake cause: %s\n", wakeCauseName(cause));
-
   if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-    const uint64_t mask = esp_sleep_get_ext1_wakeup_status();
+    const uint64_t mask = currentExt1Mask();
     Serial.printf("EXT1 wake mask: 0x%llX", static_cast<unsigned long long>(mask));
     if (mask & (1ULL << PIN_FLOAT_LOW)) Serial.print(" LOW-float");
     if (mask & (1ULL << PIN_FLOAT_HIGH)) Serial.print(" HIGH-float");
@@ -109,7 +184,6 @@ bool readRegister16(uint8_t reg, uint16_t &value) {
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;
   if (Wire.requestFrom(MAX17048_I2C_ADDRESS, static_cast<uint8_t>(2)) != 2) return false;
-
   value = (static_cast<uint16_t>(Wire.read()) << 8) |
           static_cast<uint16_t>(Wire.read());
   return true;
@@ -123,40 +197,6 @@ bool writeRegister16(uint8_t reg, uint16_t value) {
   return Wire.endTransmission() == 0;
 }
 
-bool readMax17048(Max17048Telemetry &t) {
-  t = Max17048Telemetry{};
-
-  Wire.beginTransmission(MAX17048_I2C_ADDRESS);
-  if (Wire.endTransmission() != 0) return false;
-
-  uint16_t rawVcell = 0;
-  uint16_t rawSoc = 0;
-  if (!readRegister16(MAX17048_REG_VERSION, t.version) ||
-      (t.version & 0xFFF0) != 0x0010 ||
-      !readRegister16(MAX17048_REG_VCELL, rawVcell) ||
-      !readRegister16(MAX17048_REG_SOC, rawSoc)) {
-    return false;
-  }
-
-  t.voltage = static_cast<float>(rawVcell) * 78.125f / 1000000.0f;
-  t.soc = static_cast<float>(rawSoc) / 256.0f;
-  t.valid = true;
-  return true;
-}
-
-uint8_t batteryPercentage(float soc) {
-  if (soc <= 0.0f) return 0;
-  if (soc >= 100.0f) return 100;
-  return static_cast<uint8_t>(soc + 0.5f);
-}
-
-uint8_t batteryVoltageZcl(float voltage) {
-  if (voltage <= 0.0f) return 0;
-  const float units = voltage * 10.0f;
-  if (units >= 254.0f) return 254;
-  return static_cast<uint8_t>(units + 0.5f);
-}
-
 void acknowledgeMax17048Alert() {
   uint16_t rawStatus = 0;
   uint16_t config = 0;
@@ -167,11 +207,9 @@ void acknowledgeMax17048Alert() {
 
   const uint8_t status = static_cast<uint8_t>(rawStatus >> 8);
   if (status & MAX17048_STATUS_RI) {
-    writeRegister16(
-        MAX17048_REG_STATUS,
-        rawStatus & ~(static_cast<uint16_t>(MAX17048_STATUS_RI) << 8));
+    writeRegister16(MAX17048_REG_STATUS,
+                    rawStatus & ~(static_cast<uint16_t>(MAX17048_STATUS_RI) << 8));
   }
-
   if (config & MAX17048_CONFIG_ALRT) {
     writeRegister16(MAX17048_REG_CONFIG, config & ~MAX17048_CONFIG_ALRT);
   }
@@ -191,72 +229,116 @@ float readWaterTemperatureC() {
 
   temperatureSensors.setResolution(10);
   temperatureSensors.requestTemperatures();
-  const float temperatureC = temperatureSensors.getTempCByIndex(0);
+  const float value = temperatureSensors.getTempCByIndex(0);
 
-  // Remove all possible parasitic DS18B20 current before sleeping.
   pinMode(PIN_DS18B20_DATA, INPUT);
   digitalWrite(PIN_DS18B20_POWER, LOW);
-  return temperatureC;
+  return value;
 }
 
-void configureZigbeeEndpoints() {
+SensorSnapshot readSensorSnapshot() {
+  SensorSnapshot snapshot;
+
+  releaseRtcWakePins();
+  pinMode(PIN_FLOAT_LOW, INPUT_PULLUP);
+  pinMode(PIN_FLOAT_HIGH, INPUT_PULLUP);
+  pinMode(PIN_MAX17048_INT, INPUT_PULLUP);
+  pinMode(PIN_DS18B20_POWER, OUTPUT);
+  digitalWrite(PIN_DS18B20_POWER, LOW);
+  pinMode(PIN_DS18B20_DATA, INPUT);
+
+  snapshot.lowClosed = digitalRead(PIN_FLOAT_LOW) == LOW;
+  snapshot.highClosed = digitalRead(PIN_FLOAT_HIGH) == LOW;
+  snapshot.maxIntLow = digitalRead(PIN_MAX17048_INT) == LOW;
+
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(100000);
+
+  uint16_t rawVcell = 0;
+  uint16_t rawSoc = 0;
+  uint16_t version = 0;
+  Wire.beginTransmission(MAX17048_I2C_ADDRESS);
+  if (Wire.endTransmission() == 0 &&
+      readRegister16(MAX17048_REG_VERSION, version) &&
+      readRegister16(MAX17048_REG_VCELL, rawVcell) &&
+      readRegister16(MAX17048_REG_SOC, rawSoc)) {
+    snapshot.batteryValid = true;
+    snapshot.maxVersion = version;
+    snapshot.batteryVoltage = static_cast<float>(rawVcell) * 78.125f / 1000000.0f;
+    snapshot.batterySocRaw = static_cast<float>(rawSoc) / 256.0f;
+
+    float clampedSoc = snapshot.batterySocRaw;
+    if (clampedSoc < 0.0f) clampedSoc = 0.0f;
+    if (clampedSoc > 100.0f) clampedSoc = 100.0f;
+    snapshot.batteryPercent = static_cast<uint8_t>(clampedSoc + 0.5f);
+
+    int voltage100mV = static_cast<int>(snapshot.batteryVoltage * 10.0f + 0.5f);
+    if (voltage100mV < 0) voltage100mV = 0;
+    if (voltage100mV > 255) voltage100mV = 255;
+    snapshot.batteryVoltageZcl = static_cast<uint8_t>(voltage100mV);
+  }
+
+  const float temperature = readWaterTemperatureC();
+  if (temperature != DEVICE_DISCONNECTED_C && temperature > -55.0f && temperature < 85.0f) {
+    snapshot.temperatureValid = true;
+    snapshot.waterTemperatureC = temperature;
+  }
+
+  acknowledgeMax17048Alert();
+  return snapshot;
+}
+
+bool configureZigbeeEndpoints(const SensorSnapshot &snapshot) {
+  bool ok = true;
+
   zbTemperature.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   zbTemperature.setMinMaxValue(-10, 60);
-  zbTemperature.setDefaultValue(20.0);
+  zbTemperature.setDefaultValue(snapshot.waterTemperatureC);
   zbTemperature.setTolerance(1);
-
-  Max17048Telemetry initialBattery;
-  uint8_t initialPercentage = 100;
-  uint8_t initialVoltage = 40;
-  if (readMax17048(initialBattery)) {
-    initialPercentage = batteryPercentage(initialBattery.soc);
-    initialVoltage = batteryVoltageZcl(initialBattery.voltage);
-  }
-  zbTemperature.setPowerSource(
-      ZB_POWER_SOURCE_BATTERY, initialPercentage, initialVoltage);
+  ok &= zbTemperature.setPowerSource(
+      ZB_POWER_SOURCE_BATTERY,
+      snapshot.batteryPercent,
+      snapshot.batteryVoltageZcl);
 
   zbLowLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
-  zbLowLevel.addBinaryInput();
-  zbLowLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
-  zbLowLevel.setBinaryInputDescription("Low Level");
+  ok &= zbLowLevel.addBinaryInput();
+  ok &= zbLowLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
+  ok &= zbLowLevel.setBinaryInputDescription("Low Level");
+  ok &= zbLowLevel.preloadBinaryInput(snapshot.lowClosed);
 
   zbHighLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
-  zbHighLevel.addBinaryInput();
-  zbHighLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
-  zbHighLevel.setBinaryInputDescription("High Level");
+  ok &= zbHighLevel.addBinaryInput();
+  ok &= zbHighLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
+  ok &= zbHighLevel.setBinaryInputDescription("High Level");
+  ok &= zbHighLevel.preloadBinaryInput(snapshot.highClosed);
 
-  Zigbee.addEndpoint(&zbTemperature);
-  Zigbee.addEndpoint(&zbLowLevel);
-  Zigbee.addEndpoint(&zbHighLevel);
+  ok &= Zigbee.addEndpoint(&zbTemperature);
+  ok &= Zigbee.addEndpoint(&zbLowLevel);
+  ok &= Zigbee.addEndpoint(&zbHighLevel);
+  return ok;
 }
 
 bool startZigbee() {
-  Serial.println("Starting Zigbee sleepy End Device...");
-
-  // Follow Espressif's sleepy-device pattern: bounded begin timeout and a
-  // 10-second end-device keepalive while awake.
   esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
   zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 10000;
   Zigbee.setTimeout(10000);
 
+  Serial.println("Starting Zigbee sleepy End Device...");
   if (!Zigbee.begin(&zigbeeConfig, false)) {
-    Serial.println("Zigbee begin failed; sleeping instead of reboot-looping.");
+    Serial.println("Zigbee begin failed");
     return false;
   }
 
-  zbTemperature.setReporting(1, 3600, 0.25);
-
   Serial.print("Waiting for Zigbee network");
   const uint32_t startedAt = millis();
-  while (!Zigbee.connected() &&
-         millis() - startedAt < SKIMMERSENSE_ZIGBEE_WAIT_MS) {
+  while (!Zigbee.connected() && millis() - startedAt < SKIMMERSENSE_ZIGBEE_WAIT_MS) {
     Serial.print(".");
     delay(100);
   }
   Serial.println();
 
   if (!Zigbee.connected()) {
-    Serial.println("Zigbee reconnect timeout; will retry after next wake.");
+    Serial.println("Zigbee reconnect timeout");
     return false;
   }
 
@@ -264,58 +346,38 @@ bool startZigbee() {
   return true;
 }
 
-void publishSnapshot() {
-  // Deep sleep resets the MCU, so always publish the complete current state.
-  const bool lowRaw = digitalRead(PIN_FLOAT_LOW);
-  const bool highRaw = digitalRead(PIN_FLOAT_HIGH);
+bool sendSafeReport(uint8_t endpoint, uint16_t clusterId, uint16_t attributeId, const char *label) {
+  esp_zb_zcl_report_attr_cmd_t report{};
+  report.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
+  report.attributeID = attributeId;
+  report.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+  report.clusterID = clusterId;
+  report.zcl_basic_cmd.src_endpoint = endpoint;
+  report.manuf_specific = 0x00U;
+  report.dis_default_resp = 0x00U;
 
-  zbLowLevel.setBinaryInput(lowRaw == LOW);
-  zbHighLevel.setBinaryInput(highRaw == LOW);
-
-  const float temperatureC = readWaterTemperatureC();
-  if (temperatureC != DEVICE_DISCONNECTED_C) {
-    zbTemperature.setTemperature(temperatureC);
+  Serial.printf("Report %-12s: queue...\n", label);
+  if (!esp_zb_lock_acquire(portMAX_DELAY)) {
+    Serial.printf("Report %-12s: Zigbee lock FAILED\n", label);
+    return false;
   }
+  const esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report);
+  esp_zb_lock_release();
 
-  Max17048Telemetry battery;
-  if (readMax17048(battery)) {
-    const uint8_t percentage = batteryPercentage(battery.soc);
-    const uint8_t voltage = batteryVoltageZcl(battery.voltage);
-    zbTemperature.setBatteryPercentage(percentage);
-    zbTemperature.setBatteryVoltage(voltage);
-    Serial.printf(
-        "Battery attributes: %u %% | %.3f V | raw SOC %.1f %%\n",
-        percentage, battery.voltage, battery.soc);
+  if (err != ESP_OK) {
+    Serial.printf("Report %-12s: FAILED 0x%x (%s)\n", label, err, esp_err_to_name(err));
+    return false;
   }
-
-  Serial.printf("Float LOW : %s\n", contactState(lowRaw));
-  Serial.printf("Float HIGH: %s\n", contactState(highRaw));
-  if (temperatureC != DEVICE_DISCONNECTED_C) {
-    Serial.printf("Water temperature: %.2f C\n", temperatureC);
-  } else {
-    Serial.println("DS18B20: not detected");
-  }
-
-  if (Zigbee.connected()) {
-    zbLowLevel.reportBinaryInput();
-    zbHighLevel.reportBinaryInput();
-    if (temperatureC != DEVICE_DISCONNECTED_C) {
-      zbTemperature.reportTemperature();
-    }
-    // Do not call reportBatteryPercentage(): this remains intentionally
-    // disabled because it triggered the ZBOSS assertion on Arduino-ESP32 3.3.x.
-  }
+  Serial.printf("Report %-12s: queued OK\n", label);
+  return true;
 }
 
 bool armOppositeLevelWake(uint8_t pin, bool currentHigh, const char *label) {
   const gpio_num_t gpio = static_cast<gpio_num_t>(pin);
   if (!esp_sleep_is_valid_wakeup_gpio(gpio)) {
-    Serial.printf("Wake pin %s GPIO%u is invalid\n", label, pin);
+    Serial.printf("Wake pin %s GPIO%u invalid\n", label, pin);
     return false;
   }
-
-  // Float switches and MAX17048 ALRT are active-to-GND, so keep a pull-up
-  // during deep sleep. On ESP32-C6 GPIO0..7 are RTC wake-capable.
   if (rtc_gpio_init(gpio) != ESP_OK ||
       rtc_gpio_pulldown_dis(gpio) != ESP_OK ||
       rtc_gpio_pullup_en(gpio) != ESP_OK) {
@@ -323,16 +385,11 @@ bool armOppositeLevelWake(uint8_t pin, bool currentHigh, const char *label) {
     return false;
   }
 
-  // EXT1 is level-sensitive. Arm each C6 pin for the *opposite* of its current
-  // level, so a held switch cannot cause an immediate wake-sleep loop.
   const esp_sleep_ext1_wakeup_mode_t mode =
       currentHigh ? ESP_EXT1_WAKEUP_ANY_LOW : ESP_EXT1_WAKEUP_ANY_HIGH;
-
-  const esp_err_t err =
-      esp_sleep_enable_ext1_wakeup_io(1ULL << pin, mode);
+  const esp_err_t err = esp_sleep_enable_ext1_wakeup_io(1ULL << pin, mode);
   if (err != ESP_OK) {
-    Serial.printf("Failed to arm %s GPIO%u: %s\n",
-                  label, pin, esp_err_to_name(err));
+    Serial.printf("Failed to arm %s GPIO%u: %s\n", label, pin, esp_err_to_name(err));
     return false;
   }
 
@@ -344,98 +401,261 @@ bool armOppositeLevelWake(uint8_t pin, bool currentHigh, const char *label) {
   return true;
 }
 
-void prepareAndEnterDeepSleep() {
-  // Give Zigbee reports time to leave the radio queue before powering down.
-  delay(SKIMMERSENSE_REPORT_SETTLE_MS);
+LevelState loadState(esp_sleep_wakeup_cause_t cause) {
+  if (cause == ESP_SLEEP_WAKEUP_UNDEFINED || rtcMagic != RTC_MAGIC ||
+      rtcStateRaw > static_cast<uint8_t>(LevelState::WAIT_HIGH)) {
+    rtcMagic = RTC_MAGIC;
+    rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
+    return LevelState::NORMAL;
+  }
+  return static_cast<LevelState>(rtcStateRaw);
+}
 
-  // Re-read after the settle delay in case a float moved while reports were sent.
-  const bool lowRaw = digitalRead(PIN_FLOAT_LOW);
-  const bool highRaw = digitalRead(PIN_FLOAT_HIGH);
-  const bool intRaw = digitalRead(PIN_MAX17048_INT);
+CyclePlan makePlan(LevelState state,
+                   const SensorSnapshot &snapshot,
+                   esp_sleep_wakeup_cause_t cause,
+                   uint64_t extMask) {
+  CyclePlan plan;
+  const bool timerWake = cause == ESP_SLEEP_WAKEUP_TIMER;
+  const bool coldBoot = cause == ESP_SLEEP_WAKEUP_UNDEFINED;
+  const bool maxWake = (extMask & (1ULL << PIN_MAX17048_INT)) != 0;
+
+  switch (state) {
+    case LevelState::NORMAL:
+      if (snapshot.lowClosed) {
+        plan.nextState = LevelState::LOW_PENDING;
+        plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
+        plan.reason = "LOW closed -> confirmation sleep; float wake disabled";
+      } else {
+        plan.nextState = LevelState::NORMAL;
+        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+        plan.watchLow = true;
+        plan.watchMax = true;
+        plan.reason = "normal monitoring: LOW + MAX17048 wake armed";
+        plan.useZigbee = coldBoot || timerWake;
+        plan.reportTemperature = plan.useZigbee;
+        plan.reportFloats = plan.useZigbee;
+        if (maxWake) {
+          plan.useZigbee = false;  // Battery report path is unsafe in this ZBOSS version.
+          plan.reportTemperature = false;
+          plan.reportFloats = false;
+          plan.reason = "MAX17048 alert acknowledged; battery report intentionally skipped";
+        }
+      }
+      break;
+
+    case LevelState::LOW_PENDING:
+      if (!snapshot.lowClosed) {
+        plan.nextState = LevelState::NORMAL;
+        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+        plan.watchLow = true;
+        plan.watchMax = true;
+        plan.reason = "LOW reopened during confirmation -> rejected as wave/bather motion";
+      } else if (!snapshot.highClosed) {
+        plan.nextState = LevelState::NORMAL;
+        plan.useZigbee = true;
+        plan.reportTemperature = true;
+        plan.reportFloats = true;
+        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+        plan.watchLow = true;
+        plan.watchMax = true;
+        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish fault state";
+      } else {
+        plan.nextState = LevelState::WAIT_HIGH;
+        plan.useZigbee = true;
+        plan.reportTemperature = true;
+        plan.reportFloats = true;
+        plan.sleepSeconds = SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS;
+        plan.watchHigh = true;
+        plan.watchMax = true;
+        plan.reason = "LOW confirmed -> publish ON/ON, then ignore LOW and watch HIGH";
+      }
+      break;
+
+    case LevelState::WAIT_HIGH:
+      if (!snapshot.highClosed) {
+        plan.nextState = LevelState::NORMAL;
+        plan.useZigbee = true;
+        plan.reportTemperature = true;
+        plan.reportFloats = true;
+        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+        plan.watchLow = true;
+        plan.watchMax = true;
+        plan.reason = "HIGH opened -> publish final float states and return NORMAL";
+      } else {
+        plan.nextState = LevelState::WAIT_HIGH;
+        plan.sleepSeconds = SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS;
+        plan.watchHigh = true;
+        plan.watchMax = true;
+        plan.reason = "waiting for HIGH to open; LOW transitions intentionally ignored";
+        if (timerWake) {
+          plan.useZigbee = true;
+          plan.reportTemperature = true;
+          plan.reportFloats = false;
+        }
+        if (maxWake) {
+          plan.useZigbee = false;
+          plan.reportTemperature = false;
+          plan.reportFloats = false;
+          plan.reason = "MAX17048 alert acknowledged while WAIT_HIGH; continue watching HIGH";
+        }
+      }
+      break;
+  }
+
+  return plan;
+}
+
+[[noreturn]] void enterPlannedSleep(CyclePlan plan) {
+  pinMode(PIN_DS18B20_DATA, INPUT);
+  digitalWrite(PIN_DS18B20_POWER, LOW);
+
+  // If LOW became closed while we were awake in NORMAL, start confirmation now
+  // rather than arming the opposite edge and waiting for the long fallback timer.
+  if (plan.nextState == LevelState::NORMAL && plan.watchLow &&
+      digitalRead(PIN_FLOAT_LOW) == LOW) {
+    Serial.println("LOW became CLOSED before sleep -> switching to LOW_PENDING.");
+    plan.nextState = LevelState::LOW_PENDING;
+    plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
+    plan.watchLow = false;
+    plan.watchHigh = false;
+    plan.watchMax = false;
+  }
+
+  rtcMagic = RTC_MAGIC;
+  rtcStateRaw = static_cast<uint8_t>(plan.nextState);
 
   esp_sleep_disable_ext1_wakeup_io(0);
+  bool wakeOk = true;
 
-  bool wakePinsOk = true;
-  wakePinsOk &= armOppositeLevelWake(PIN_FLOAT_LOW, lowRaw == HIGH, "LOW-float");
-  wakePinsOk &= armOppositeLevelWake(PIN_FLOAT_HIGH, highRaw == HIGH, "HIGH-float");
-  wakePinsOk &= armOppositeLevelWake(PIN_MAX17048_INT, intRaw == HIGH, "MAX17048-ALRT");
+  if (plan.watchLow) {
+    const bool high = digitalRead(PIN_FLOAT_LOW) == HIGH;
+    wakeOk &= armOppositeLevelWake(PIN_FLOAT_LOW, high, "LOW-float");
+  }
+  if (plan.watchHigh) {
+    const bool high = digitalRead(PIN_FLOAT_HIGH) == HIGH;
+    wakeOk &= armOppositeLevelWake(PIN_FLOAT_HIGH, high, "HIGH-float");
+  }
+  if (plan.watchMax) {
+    const bool high = digitalRead(PIN_MAX17048_INT) == HIGH;
+    wakeOk &= armOppositeLevelWake(PIN_MAX17048_INT, high, "MAX17048-ALRT");
+  }
 
-  const esp_err_t timerErr = esp_sleep_enable_timer_wakeup(
-      static_cast<uint64_t>(SKIMMERSENSE_SLEEP_SECONDS) * 1000000ULL);
+  const esp_err_t timerErr = esp_sleep_enable_timer_wakeup(plan.sleepSeconds * 1000000ULL);
   if (timerErr != ESP_OK) {
     Serial.printf("Failed to arm timer wake: %s\n", esp_err_to_name(timerErr));
   }
 
-  // DS18B20 must be fully unpowered/high-Z before deep sleep.
-  pinMode(PIN_DS18B20_DATA, INPUT);
-  digitalWrite(PIN_DS18B20_POWER, LOW);
-
-  Serial.printf("Deep sleep: %llu s timer | GPIO wake %s\n",
-                static_cast<unsigned long long>(SKIMMERSENSE_SLEEP_SECONDS),
-                wakePinsOk ? "armed" : "PARTIAL/FAILED");
+  Serial.printf("Next state: %s\n", stateName(plan.nextState));
+  Serial.printf("Deep sleep: %llu s | GPIO wake %s\n",
+                static_cast<unsigned long long>(plan.sleepSeconds),
+                wakeOk ? "armed as planned" : "PARTIAL/FAILED");
   Serial.println("Going to deep sleep now.");
   Serial.flush();
   delay(20);
   esp_deep_sleep_start();
-}
-
-bool factoryResetRequestedAtBoot() {
-  if (digitalRead(PIN_FACTORY_RESET) != LOW) return false;
-
-  Serial.println("BOOT held: keep holding for 3 seconds to factory-reset Zigbee.");
-  const uint32_t startedAt = millis();
-  while (digitalRead(PIN_FACTORY_RESET) == LOW &&
-         millis() - startedAt < 3100) {
-    delay(25);
-  }
-  return millis() - startedAt >= 3000;
+  while (true) delay(1000);
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1200);
 
-  releaseRtcWakePins();
-
-  pinMode(PIN_FACTORY_RESET, INPUT_PULLUP);
-  pinMode(PIN_FLOAT_LOW, INPUT_PULLUP);
-  pinMode(PIN_FLOAT_HIGH, INPUT_PULLUP);
-  pinMode(PIN_MAX17048_INT, INPUT_PULLUP);
-  pinMode(PIN_DS18B20_POWER, OUTPUT);
-  digitalWrite(PIN_DS18B20_POWER, LOW);
-  pinMode(PIN_DS18B20_DATA, INPUT);
-
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  Wire.setClock(100000);
+  const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  const uint64_t extMask = currentExt1Mask();
+  const LevelState state = loadState(cause);
 
   Serial.println();
   Serial.println("========================================");
   Serial.printf(" SkimmerSense v%s\n", FIRMWARE_VERSION);
-  Serial.println(" XIAO ESP32-C6 / Zigbee sleepy End Device");
+  Serial.println(" Anti-wave RTC state machine test");
+  Serial.println(" Battery Power Config preloaded; battery report DISABLED");
   Serial.println("========================================");
   printWakeReason();
+  Serial.printf("RTC state: %s\n", stateName(state));
 
-  const bool resetRequested = factoryResetRequestedAtBoot();
-
-  acknowledgeMax17048Alert();
-  configureZigbeeEndpoints();
-  const bool connected = startZigbee();
-
-  if (resetRequested) {
-    Serial.println("Factory-resetting Zigbee network data...");
-    delay(250);
-    Zigbee.factoryReset();
-    return;
+  const SensorSnapshot snapshot = readSensorSnapshot();
+  Serial.printf("Float LOW : %s\n", contactState(snapshot.lowClosed));
+  Serial.printf("Float HIGH: %s\n", contactState(snapshot.highClosed));
+  if (snapshot.temperatureValid) {
+    Serial.printf("Water temperature: %.2f C\n", snapshot.waterTemperatureC);
+  } else {
+    Serial.println("Water temperature: invalid");
+  }
+  if (snapshot.batteryValid) {
+    Serial.printf("MAX17048: VERSION=0x%04X | %.3f V | raw SOC %.1f %% | Zigbee %u %% | INT was %s\n",
+                  snapshot.maxVersion,
+                  snapshot.batteryVoltage,
+                  snapshot.batterySocRaw,
+                  snapshot.batteryPercent,
+                  snapshot.maxIntLow ? "LOW" : "HIGH");
+  } else {
+    Serial.println("MAX17048: unavailable");
   }
 
-  if (connected) {
-    publishSnapshot();
+  CyclePlan plan = makePlan(state, snapshot, cause, extMask);
+  Serial.printf("Decision: %s\n", plan.reason);
+
+  if (plan.useZigbee) {
+    Serial.println("Preloading Zigbee attributes BEFORE Zigbee.begin()...");
+    if (!configureZigbeeEndpoints(snapshot)) {
+      Serial.println("Preload/configuration FAILED; sleeping without Zigbee.");
+      plan.useZigbee = false;
+      plan.reportTemperature = false;
+      plan.reportFloats = false;
+    } else if (!startZigbee()) {
+      plan.useZigbee = false;
+      plan.reportTemperature = false;
+      plan.reportFloats = false;
+    } else {
+      Serial.printf("Connected; idling %lu ms without runtime attribute writes...\n",
+                    static_cast<unsigned long>(SKIMMERSENSE_ZIGBEE_IDLE_MS));
+      delay(SKIMMERSENSE_ZIGBEE_IDLE_MS);
+
+      bool reportsOk = true;
+      if (plan.reportTemperature && snapshot.temperatureValid) {
+        reportsOk &= sendSafeReport(
+            ZB_EP_TEMPERATURE,
+            ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+            ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+            "temperature");
+        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+      }
+
+      if (plan.reportFloats) {
+        // LOW first, then HIGH. During refill this lets HA see OFF/ON briefly
+        // before OFF/OFF when the high float opens.
+        reportsOk &= sendSafeReport(
+            ZB_EP_LOW_LEVEL,
+            ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+            ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+            "low-float");
+        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+        reportsOk &= sendSafeReport(
+            ZB_EP_HIGH_LEVEL,
+            ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+            ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+            "high-float");
+        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+      }
+
+      if (snapshot.batteryValid) {
+        Serial.println("Report battery     : SKIPPED - ZBOSS bug");
+      }
+
+      Serial.printf("Post-report wait: %lu ms...\n",
+                    static_cast<unsigned long>(SKIMMERSENSE_POST_REPORT_WAIT_MS));
+      delay(SKIMMERSENSE_POST_REPORT_WAIT_MS);
+      Serial.printf("Zigbee cycle survived. Reports queued: %s\n",
+                    reportsOk ? "ALL OK" : "PARTIAL/FAILED");
+    }
+  } else {
+    Serial.println("Zigbee cycle intentionally skipped for this state transition.");
   }
 
-  prepareAndEnterDeepSleep();
+  enterPlannedSleep(plan);
 }
 
 void loop() {
-  // setup() always enters deep sleep; loop() should never be reached.
   delay(1000);
 }
