@@ -301,10 +301,10 @@ bool configureZigbeeEndpoints(const SensorSnapshot &snapshot) {
   zbTemperature.setMinMaxValue(-10, 60);
   zbTemperature.setDefaultValue(snapshot.waterTemperatureC);
   zbTemperature.setTolerance(1);
-  ok &= zbTemperature.setPowerSource(
-      ZB_POWER_SOURCE_BATTERY,
-      snapshot.batteryPercent,
-      snapshot.batteryVoltageZcl);
+// Power Configuration disabled.
+// ESP32-C6 Arduino Zigbee stack / ZBOSS crash observed with setPowerSource().
+// Battery monitoring remains available through MAX17048.
+  ok &= true;
 
   zbLowLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   ok &= zbLowLevel.addBinaryInput();
@@ -513,14 +513,21 @@ CyclePlan makePlan(LevelState state,
 }
 
 [[noreturn]] void enterPlannedSleep(CyclePlan plan) {
+  const LevelState previousState =
+    static_cast<LevelState>(rtcStateRaw);
+
   pinMode(PIN_DS18B20_DATA, INPUT);
   digitalWrite(PIN_DS18B20_POWER, LOW);
 
   // If LOW became closed while we were awake in NORMAL, start confirmation now
   // rather than arming the opposite edge and waiting for the long fallback timer.
-  if (plan.nextState == LevelState::NORMAL && plan.watchLow &&
+  if (plan.nextState == LevelState::NORMAL &&
+      previousState == LevelState::NORMAL &&
+      plan.watchLow &&
       digitalRead(PIN_FLOAT_LOW) == LOW) {
+
     Serial.println("LOW became CLOSED before sleep -> switching to LOW_PENDING.");
+
     plan.nextState = LevelState::LOW_PENDING;
     plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
     plan.watchLow = false;
@@ -588,7 +595,8 @@ void setup() {
   Serial.println("========================================");
   Serial.printf(" SkimmerSense v%s\n", FIRMWARE_VERSION);
   Serial.printf(" %s\n", FIRMWARE_FLAVOR);
-  Serial.println(" Battery Power Config preloaded; battery report DISABLED");
+  Serial.println(" Battery monitoring: MAX17048 enabled");
+  Serial.println(" Zigbee Power Configuration disabled (ZBOSS workaround)");
   Serial.println("========================================");
   printWakeReason();
   Serial.printf("RTC state: %s\n", stateName(state));
