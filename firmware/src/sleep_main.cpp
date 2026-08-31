@@ -45,7 +45,13 @@
 #include "Zigbee.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
+#ifdef SKIMMERSENSE_PRODUCTION_BUILD
+static constexpr char FIRMWARE_VERSION[] = "0.9-production";
+static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
+#else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
+static constexpr char FIRMWARE_FLAVOR[] = "Anti-wave RTC state machine test";
+#endif
 
 static constexpr uint8_t PIN_FLOAT_LOW = D0;       // GPIO0, reed to GND
 static constexpr uint8_t PIN_FLOAT_HIGH = D1;      // GPIO1, reed to GND
@@ -522,6 +528,19 @@ CyclePlan makePlan(LevelState state,
     plan.watchMax = false;
   }
 
+  // HIGH can open while the Zigbee cycle is still awake. If that happens in
+  // WAIT_HIGH, do not arm the opposite edge and wait for the long fallback.
+  // Force a one-second timer resample so the next boot publishes the fresh
+  // LOW/HIGH state and returns to NORMAL.
+  if (plan.nextState == LevelState::WAIT_HIGH && plan.watchHigh &&
+      digitalRead(PIN_FLOAT_HIGH) == HIGH) {
+    Serial.println("HIGH became OPEN before sleep -> immediate 1 s resample.");
+    plan.sleepSeconds = 1;
+    plan.watchLow = false;
+    plan.watchHigh = false;
+    plan.watchMax = false;
+  }
+
   rtcMagic = RTC_MAGIC;
   rtcStateRaw = static_cast<uint8_t>(plan.nextState);
 
@@ -568,7 +587,7 @@ void setup() {
   Serial.println();
   Serial.println("========================================");
   Serial.printf(" SkimmerSense v%s\n", FIRMWARE_VERSION);
-  Serial.println(" Anti-wave RTC state machine test");
+  Serial.printf(" %s\n", FIRMWARE_FLAVOR);
   Serial.println(" Battery Power Config preloaded; battery report DISABLED");
   Serial.println("========================================");
   printWakeReason();
