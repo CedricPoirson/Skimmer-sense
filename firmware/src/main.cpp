@@ -16,6 +16,7 @@
 // D3 -> DS18B20 1-Wire data
 // D4 -> MAX17048 SDA
 // D5 -> MAX17048 SCL
+// MTMS / GPIO4 -> MAX17048 INT/ALRT (active LOW)
 
 static constexpr uint8_t PIN_FLOAT_LOW = D0;
 static constexpr uint8_t PIN_FLOAT_HIGH = D1;
@@ -23,6 +24,7 @@ static constexpr uint8_t PIN_DS18B20_POWER = D2;
 static constexpr uint8_t PIN_DS18B20_DATA = D3;
 static constexpr uint8_t PIN_I2C_SDA = D4;
 static constexpr uint8_t PIN_I2C_SCL = D5;
+static constexpr uint8_t PIN_MAX17048_INT = 4;  // GPIO4 / MTMS, NOT D4
 static constexpr uint8_t PIN_FACTORY_RESET = BOOT_PIN;
 
 // MAX17048
@@ -51,6 +53,7 @@ ZigbeeBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
 
 bool lastLowRaw = HIGH;
 bool lastHighRaw = HIGH;
+bool lastMax17048Int = HIGH;
 uint32_t lastLowChangeMs = 0;
 uint32_t lastHighChangeMs = 0;
 uint32_t lastTemperatureMs = 0;
@@ -58,6 +61,10 @@ uint32_t lastMax17048CheckMs = 0;
 
 const char *contactState(bool rawState) {
   return rawState == LOW ? "CLOSED" : "OPEN";
+}
+
+const char *max17048IntState(bool rawState) {
+  return rawState == LOW ? "LOW (ALERT ACTIVE)" : "HIGH (inactive)";
 }
 
 bool i2cDevicePresent(uint8_t address) {
@@ -82,6 +89,8 @@ bool readMax17048Register16(uint8_t reg, uint16_t &value) {
 }
 
 void reportMax17048() {
+  Serial.printf("MAX17048 INT: %s\n", max17048IntState(digitalRead(PIN_MAX17048_INT)));
+
   if (!i2cDevicePresent(MAX17048_I2C_ADDRESS)) {
     Serial.println("MAX17048: no response on I2C address 0x36");
     return;
@@ -271,6 +280,8 @@ void setup() {
   pinMode(PIN_FACTORY_RESET, INPUT_PULLUP);
   pinMode(PIN_FLOAT_LOW, INPUT_PULLUP);
   pinMode(PIN_FLOAT_HIGH, INPUT_PULLUP);
+  // MAX17048 INT/ALRT is open-drain and the breakout provides the pull-up.
+  pinMode(PIN_MAX17048_INT, INPUT);
 
   pinMode(PIN_DS18B20_POWER, OUTPUT);
   digitalWrite(PIN_DS18B20_POWER, LOW);
@@ -281,14 +292,16 @@ void setup() {
 
   lastLowRaw = digitalRead(PIN_FLOAT_LOW);
   lastHighRaw = digitalRead(PIN_FLOAT_HIGH);
+  lastMax17048Int = digitalRead(PIN_MAX17048_INT);
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" SkimmerSense v0.4 - MAX17048 telemetry");
+  Serial.println(" SkimmerSense v0.5 - MAX17048 INT test");
   Serial.println(" XIAO ESP32-C6 / Zigbee End Device");
   Serial.println("========================================");
   Serial.printf("Float LOW : %s\n", contactState(lastLowRaw));
   Serial.printf("Float HIGH: %s\n", contactState(lastHighRaw));
+  Serial.printf("MAX17048 INT: %s\n", max17048IntState(lastMax17048Int));
 
   reportMax17048();
 
@@ -302,6 +315,7 @@ void setup() {
   Serial.println("SkimmerSense is online.");
   Serial.println("Temperature interval: 60 seconds (test mode).");
   Serial.println("MAX17048 telemetry interval: 30 seconds.");
+  Serial.println("MAX17048 INT diagnostic enabled on GPIO4 / MTMS.");
   Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
 }
 
@@ -324,6 +338,12 @@ void loop() {
     lastHighChangeMs = now;
     Serial.printf("HIGH-level float changed: %s\n", contactState(highRaw));
     publishHighFloat(highRaw);
+  }
+
+  const bool max17048Int = digitalRead(PIN_MAX17048_INT);
+  if (max17048Int != lastMax17048Int) {
+    lastMax17048Int = max17048Int;
+    Serial.printf("MAX17048 INT changed: %s\n", max17048IntState(max17048Int));
   }
 
   if (now - lastTemperatureMs >= TEMP_INTERVAL_MS) {
