@@ -30,6 +30,7 @@
 #endif
 
 #include "Zigbee.h"
+#include "zcl/esp_zigbee_zcl_power_config.h"
 
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-snapshot-reports";
 
