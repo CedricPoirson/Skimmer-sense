@@ -4,20 +4,64 @@ All notable SkimmerSense development milestones are tracked here.
 
 The project has not yet reached a production release. Version labels below refer to development firmware milestones.
 
-## Unreleased / v0.9 preparation
+## Unreleased / v0.9 production candidate
 
-Planned production-oriented cleanup before enabling deep sleep:
+The current branch now contains the hardware-validated deep-sleep / anti-wave production candidate.
 
-- compile-time debug logging control
-- bounded Zigbee reconnect/join behavior
-- cleaner MAX17048 telemetry abstraction
-- Zigbee battery percentage and optional battery voltage
-- low-power wake-source preparation for D0, D1 and GPIO4
-- sleep-safe DS18B20 shutdown
-- production reporting intervals
-- measured power-consumption validation
+### Deep sleep and wake behavior
 
-Deep sleep will not be enabled until the real protected 18650 and MAX17048 alert behavior have been validated together.
+- sleepy Zigbee End Device operation validated across repeated deep-sleep cycles
+- RTC-retained level state machine added: `NORMAL -> LOW_PENDING -> WAIT_HIGH -> NORMAL`
+- LOW float closure wakes the XIAO immediately from `NORMAL`
+- transient LOW closure is rejected after the confirmation delay
+- confirmed low level publishes `ON/ON` and enters `WAIT_HIGH`
+- LOW transitions are deliberately ignored while in `WAIT_HIGH`
+- HIGH opening wakes immediately, publishes LOW first then HIGH, and returns to `NORMAL`
+- pre-sleep LOW race handled by switching directly to `LOW_PENDING`
+- pre-sleep HIGH race handled by a one-second timer-only resample
+- MAX17048 INT/ALRT is armed as an EXT1 wake source where applicable; a real low-battery alert wake still needs hardware validation
+
+### Production timing profile
+
+`seeed_xiao_esp32c6_sleep_zigbee_production` currently uses:
+
+- periodic NORMAL refresh: 1800 s / 30 min
+- LOW confirmation: 300 s / 5 min
+- WAIT_HIGH fallback: 120 s / 2 min
+- bounded Zigbee reconnect wait: 10 s
+
+### Zigbee / ZBOSS workaround
+
+A crash in the current Arduino-ESP32 / ZBOSS stack was isolated to automatic reporting after runtime attribute mutation.
+
+Validated workaround:
+
+- read the real sensor snapshot before `Zigbee.begin()`
+- preload temperature, float and battery attributes before the Zigbee stack starts
+- avoid runtime Arduino Zigbee attribute mutation
+- send zero-initialized explicit reports for temperature and float states only
+- do **not** explicitly report `BatteryPercentageRemaining`
+
+An explicit battery report reproducibly asserts in `esp_zigbee_zcl_command.c:263`, including when addressed directly to the coordinator. The battery Power Configuration attributes remain preloaded, but reliable active battery reporting is intentionally disabled until the upstream stack issue is resolved.
+
+### Hardware validation completed
+
+- existing Zigbee pairing survives normal flashing
+- DS18B20 switched-power measurement works in the sleep build
+- LOW/HIGH float wake and report sequence validated end to end
+- MAX17048 I2C address `0x36` and VERSION `0x0012` validated
+- MAX17048 INT wiring corrected to GPIO4 / MTMS and confirmed HIGH when inactive
+- raw SOC is retained for diagnostics while Zigbee-facing percentage is clamped to 0-100%
+- GitHub Actions build passes for the current production-candidate branch
+
+### Remaining before merge to main
+
+- validate the intended protected 1S 18650 in battery-only operation
+- trigger and validate a real MAX17048 low-battery ALRT wake
+- measure final deep-sleep and wake-cycle current
+- cut/disable any unnecessary MAX17048 breakout LED before final autonomy measurement
+- observe the production profile for several days
+- connect the real refill valve and run the first supervised water-fill cycle
 
 ## v0.8 - MAX17048 post-Zigbee diagnostics
 
@@ -31,9 +75,8 @@ Observed on the current prototype:
 
 - MAX17048 address: `0x36`
 - VERSION: `0x0012`
-- STATUS can be clear while the physical INT line remains low in the USB/no-battery bench condition
 
-This condition is intentionally deferred until a real battery is installed.
+The initial apparently-stuck INT line was traced to GPIO4 being connected to `QSTRT` instead of `INT/ALRT`. After correcting the wiring, INT is HIGH when inactive and the register diagnostics are coherent.
 
 ## v0.7 - MAX17048 alert acknowledge
 
@@ -81,3 +124,4 @@ This condition is intentionally deferred until a real battery is installed.
 - automatic refill dry-run tested through IPX800 V4 relay 6
 - Home Assistant timeout and independent IPX800 timeout strategy defined
 - dashboard card added for level, water temperature and refill state
+- real solenoid/water commissioning remains pending
