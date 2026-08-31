@@ -156,7 +156,7 @@ bool sendBatteryDirectToCoordinator() {
   report.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
   report.clusterID = ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG;
   report.attributeID = ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID;
-  report.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+  report.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
   report.manuf_specific = 0x00U;
   report.dis_default_resp = 0x00U;
 
