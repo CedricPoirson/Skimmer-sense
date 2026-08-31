@@ -55,9 +55,9 @@ static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
 OneWire oneWire(PIN_DS18B20_DATA);
 DallasTemperature temperatureSensors(&oneWire);
 
-// ZigbeeBinary has no public pre-registration setter for PresentValue.  Use a
+// ZigbeeBinary has no public pre-registration setter for PresentValue. Use a
 // tiny derived class so the value can be written directly into the cluster list
-// BEFORE Zigbee.begin().  This avoids runtime esp_zb_zcl_set_attribute_val(),
+// BEFORE Zigbee.begin(). This avoids runtime esp_zb_zcl_set_attribute_val(),
 // whose automatic-reporting path is the crash we isolated in ZBOSS.
 class PreloadBinary : public ZigbeeBinary {
  public:
@@ -372,11 +372,7 @@ void setup() {
   delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
 
   if (snapshot.batteryValid) {
-    reportsOk &= sendSafeReport(
-        ZB_EP_TEMPERATURE,
-        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-        ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-        "battery");
+    Serial.println("Report battery     : SKIPPED - ZBOSS bug");
   } else {
     Serial.println("Report battery     : skipped (MAX17048 unavailable)");
   }
