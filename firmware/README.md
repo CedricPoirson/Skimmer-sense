@@ -1,30 +1,35 @@
 # Firmware
 
-SkimmerSense targets the Seeed Studio XIAO ESP32-C6.
+SkimmerSense targets the Seeed Studio XIAO ESP32-C6 and is built with PlatformIO / Arduino.
 
 ## Current status
 
-Phase 1 hardware bring-up is ready:
+The development firmware has progressed beyond basic bring-up. The following items are working on the prototype:
 
 - USB serial output at 115200 baud
-- DS18B20 water-temperature reading
-- GPIO-powered DS18B20 for future low-power operation
-- low-level float switch input
-- high-level float switch input
-- simple debounce and live state reporting
-- MAX17048 I2C presence check at address `0x36`
+- waterproof DS18B20 temperature reading
+- switched DS18B20 power from GPIO D2
+- 10-bit DS18B20 conversion
+- low-level float switch input on D0
+- high-level float switch input on D1
+- float debounce and immediate Zigbee reporting
+- Zigbee End Device startup and persistent pairing
+- Zigbee temperature endpoint
+- two Zigbee binary-input endpoints for the raw float contacts
+- MAX17048 I2C communication at address `0x36`
+- MAX17048 VERSION / STATUS / CONFIG diagnostics
+- MAX17048 VCELL / SOC / CRATE diagnostics
+- MAX17048 INT/ALRT input connected to GPIO4 / MTMS
+- long-press BOOT Zigbee factory reset
 
-The battery, real MAX17048 voltage/SOC readings, Zigbee and deep-sleep will be added after the basic sensors are validated.
-
-> With the Adafruit-style MAX17048 breakout, the MAX17048 itself is powered from the battery by default. Therefore `MAX17048: no response` is expected until a battery is connected, even though VIN is connected to the XIAO 3.3 V rail.
+The current firmware is still a **validation build**, not the final battery-optimized build. It remains awake and deliberately reports frequently so hardware behavior can be observed over USB serial.
 
 ## PlatformIO
 
-The project uses the official PlatformIO board ID `seeed_xiao_esp32c6`.
-
-From the `firmware` directory:
+From the repository root:
 
 ```bash
+cd firmware
 pio run
 pio run -t upload
 pio device monitor
@@ -32,63 +37,102 @@ pio device monitor
 
 The serial monitor runs at **115200 baud**.
 
-## Prototype wiring
+The project uses `pioarduino`'s ESP32 platform because the firmware requires the ESP32-C6 Zigbee support available there.
+
+## Current pinout
 
 | XIAO ESP32-C6 | GPIO | Function |
 |---|---:|---|
-| D0 | GPIO0 | Low-level float switch -> GND |
-| D1 | GPIO1 | High-level float switch -> GND |
-| D2 | GPIO2 | DS18B20 switched VCC (`V`) |
-| D3 | GPIO21 | DS18B20 1-Wire DATA (`S`) |
+| D0 | GPIO0 | low-level float -> GND |
+| D1 | GPIO1 | high-level float -> GND |
+| D2 | GPIO2 | DS18B20 switched VCC |
+| D3 | GPIO21 | DS18B20 1-Wire DATA |
 | D4 | GPIO22 | MAX17048 SDA |
 | D5 | GPIO23 | MAX17048 SCL |
+| MTMS pad | GPIO4 | MAX17048 INT/ALRT |
 | 3V3 | - | MAX17048 VIN |
-| GND | - | Common ground |
+| GND | - | common ground |
 
-The float inputs use the ESP32 internal pull-ups, therefore:
+See [`../hardware/wiring.md`](../hardware/wiring.md) for the complete wiring notes.
 
-- contact open = `HIGH`
-- contact closed = `LOW`
+## Zigbee device
 
-For the DS18B20, install a **4.7 kOhm pull-up resistor between D2 (sensor V/power) and D3 (sensor S/data)** unless the specific adapter being used already contains that resistor. This arrangement allows the firmware to remove power from the temperature sensor between measurements later.
+Current model strings:
 
-## First USB test
+- manufacturer: `SkimmerSense`
+- model: `SkimmerSense-v1`
 
-The battery is **not required** for this stage.
+Current endpoints:
 
-1. Leave BAT+ / BAT- and the MAX17048 battery connectors empty.
-2. Connect the XIAO to the computer over a USB-C data cable.
-3. Compile and upload the firmware.
-4. Open the serial monitor at 115200 baud.
-5. Confirm that both float switches show `OPEN` or `CLOSED` as expected.
-6. Move the LOW float by hand and check for a `LOW-level float changed` message.
-7. Move the HIGH float by hand and check for a `HIGH-level float changed` message.
-8. Confirm a plausible DS18B20 temperature appears every 10 seconds.
-9. Until the battery arrives, `MAX17048: no response on I2C address 0x36` is normal.
+| Endpoint | Class | Function |
+|---:|---|---|
+| 10 | `ZigbeeTempSensor` | pool-water temperature |
+| 11 | `ZigbeeBinary` | low float raw contact |
+| 12 | `ZigbeeBinary` | high float raw contact |
 
-## Development plan
+Float logic is active-low at the GPIO and exposed semantically as:
 
-1. **USB serial bring-up** - ready
-2. **DS18B20 temperature reading** - ready for hardware test
-3. **Low/high float switch handling** - ready for hardware test
-4. **MAX17048 I2C wiring check** - ready; real data requires battery
-5. MAX17048 battery voltage and state-of-charge
-6. Zigbee device definition and Home Assistant pairing
-7. Deep-sleep timer wake-up
-8. Wake-up on float switch state changes
-9. Power optimization and long-duration battery testing
+- contact CLOSED -> binary ON
+- contact OPEN -> binary OFF
 
-## Planned Zigbee attributes
+## Development timing
 
-- Water temperature
-- Low-level state
-- High-level state
-- Battery percentage
-- Battery voltage (if exposed cleanly)
+The validation firmware currently uses short intervals on purpose:
 
-## Target timing
+- water temperature: approximately every 60 seconds
+- MAX17048 diagnostics: approximately every 30 seconds
+- float changes: immediate while awake
 
-- Periodic temperature/battery report: every 30-60 minutes
-- Level changes: transmitted immediately after wake-up
+These values are **not** intended for the final battery build.
 
-During initial USB testing, temperature is deliberately sampled every 10 seconds to make troubleshooting faster.
+## MAX17048 validation
+
+The gauge is detected and register access works. The current board reports VERSION `0x0012`.
+
+Battery readings taken with the XIAO powered by USB-C while no real cell is connected must not be interpreted as real SOC data. The charger/battery node can be biased in that condition.
+
+The remaining battery-validation sequence is:
+
+1. install the intended protected 18650
+2. test with USB-C connected
+3. test again on battery only
+4. validate VCELL and SOC plausibility
+5. validate CRATE direction and stability
+6. validate STATUS / CONFIG behavior
+7. validate the active-low INT/ALRT line on GPIO4
+8. only then expose battery attributes over Zigbee
+
+## v0.9 production-preparation goals
+
+The next firmware milestone should focus on structure and low-power readiness without prematurely enabling deep sleep:
+
+- separate diagnostic logging from production behavior with a compile-time debug switch
+- centralize timing constants and production defaults
+- make Zigbee reconnect/join behavior bounded rather than waiting forever
+- add clean MAX17048 telemetry functions suitable for Zigbee publication
+- add battery percentage and, if useful, battery voltage endpoints/attributes
+- prepare wake-source handling for D0, D1 and GPIO4
+- ensure DS18B20 DATA is high-impedance and sensor power is off before sleep
+- preserve Zigbee pairing information across normal firmware updates
+
+Deep sleep should be enabled only after the real battery/MAX17048 behavior has been validated.
+
+## Low-power target
+
+The production concept is a sleepy Zigbee end device rather than a continuously awake sensor.
+
+Expected behavior:
+
+- sleep most of the time
+- wake immediately for a meaningful float change
+- wake periodically for temperature and battery reporting
+- report only changed/required data
+- return to sleep after the Zigbee report has completed
+
+The final report interval will be selected from measured power consumption rather than guessed from datasheets.
+
+## Factory reset
+
+Holding the XIAO BOOT button for more than approximately 3 seconds clears Zigbee network data through `Zigbee.factoryReset()`.
+
+Do not erase the complete ESP32 flash during routine firmware updates because that also destroys the stored Zigbee network information and forces re-pairing.
