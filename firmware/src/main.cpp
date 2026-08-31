@@ -25,7 +25,7 @@
 
 #include "Zigbee.h"
 
-static constexpr char FIRMWARE_VERSION[] = "0.9-battery-zigbee";
+static constexpr char FIRMWARE_VERSION[] = "0.9-battery-zigbee-safe";
 
 // SkimmerSense pinout for Seeed Studio XIAO ESP32-C6.
 static constexpr uint8_t PIN_FLOAT_LOW = D0;
@@ -85,8 +85,8 @@ struct Max17048Telemetry {
 OneWire oneWire(PIN_DS18B20_DATA);
 DallasTemperature temperatureSensors(&oneWire);
 
-// Battery Power Configuration cluster is attached to endpoint 10 so the
-// device keeps the same three endpoints already known by Zigbee2MQTT/HA.
+// Power Configuration is attached to endpoint 10. Keeping battery information
+// on the temperature endpoint preserves the existing 10/11/12 endpoint layout.
 ZigbeeTempSensor zbTemperature(ZB_EP_TEMPERATURE);
 ZigbeeBinary zbLowLevel(ZB_EP_LOW_LEVEL);
 ZigbeeBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
@@ -392,7 +392,7 @@ void publishTemperature(float temperatureC) {
   }
 }
 
-bool publishBatteryFromMax17048(bool force = false) {
+bool updateBatteryAttributesFromMax17048(bool force = false) {
   Max17048Telemetry t;
   if (!readMax17048Telemetry(t) || !t.telemetryValid) {
     if (SKIMMERSENSE_DEBUG) {
@@ -420,22 +420,17 @@ bool publishBatteryFromMax17048(bool force = false) {
     }
   }
 
-  // BatteryPercentageRemaining is reportable. BatteryVoltage is a standard
-  // Power Configuration attribute but the Arduino Zigbee helper does not
-  // provide a reportBatteryVoltage() method, so it remains readable on demand.
-  if (Zigbee.connected() && (force || percentageChanged)) {
-    if (!zbTemperature.reportBatteryPercentage()) {
-      Serial.println("Zigbee battery: percentage report failed");
-      return false;
-    }
-  }
-
+  // IMPORTANT: do not call reportBatteryPercentage() here. Arduino-ESP32
+  // 3.3.x / ESP-ZBOSS can assert in esp_zigbee_zcl_command.c when an explicit
+  // Power Configuration report is sent immediately after network connection.
+  // Keep the standard attributes updated locally; Zigbee2MQTT can discover,
+  // read, bind and configure the Power Configuration cluster during reconfigure.
   lastPublishedBatteryPercentage = percentage;
   lastPublishedBatteryVoltage = voltage;
 
   if (SKIMMERSENSE_DEBUG || force) {
     Serial.printf(
-        "Zigbee battery: %u %% | %.3f V (ZCL voltage=%u x 100mV) | raw SOC %.1f %%\n",
+        "Zigbee battery attributes: %u %% | %.3f V (ZCL voltage=%u x 100mV) | raw SOC %.1f %%\n",
         percentage,
         t.voltage,
         voltage,
@@ -451,12 +446,11 @@ void configureZigbeeEndpoints() {
   zbTemperature.setDefaultValue(20.0);
   zbTemperature.setTolerance(1);
 
-  // Add the standard ZCL Power Configuration cluster (0x0001) on endpoint 10.
-  // Seed it from the MAX17048 before Zigbee.begin(), because the cluster list
-  // must exist when the endpoint is registered with the Zigbee stack.
+  // Add standard ZCL Power Configuration cluster 0x0001 on endpoint 10.
+  // It must be part of the endpoint cluster list before Zigbee.begin().
   Max17048Telemetry initialBattery;
   uint8_t initialPercentage = 100;
-  uint8_t initialVoltage = 40;  // 4.0 V fallback for bench discovery only.
+  uint8_t initialVoltage = 40;  // 4.0 V fallback used only for bench discovery.
   if (readMax17048Telemetry(initialBattery) && initialBattery.telemetryValid) {
     initialPercentage = zigbeeBatteryPercentage(initialBattery.soc);
     initialVoltage = zigbeeBatteryVoltage(initialBattery.voltage);
@@ -491,7 +485,7 @@ void publishCurrentState() {
   publishLowFloat(stableLowRaw, true);
   publishHighFloat(stableHighRaw, true);
   publishTemperature(readWaterTemperatureC());
-  publishBatteryFromMax17048(true);
+  updateBatteryAttributesFromMax17048(true);
 }
 
 void handleZigbeeConnectionChange() {
@@ -586,8 +580,7 @@ void setup() {
   pinMode(PIN_FLOAT_LOW, INPUT_PULLUP);
   pinMode(PIN_FLOAT_HIGH, INPUT_PULLUP);
 
-  // MAX17048 ALRT/INT is open-drain. GPIO4 now connects to the actual ALRT
-  // output (not QSTRT). Internal pull-up is useful for the bench build.
+  // MAX17048 ALRT/INT is open-drain. GPIO4 connects to actual ALRT, not QSTRT.
   pinMode(PIN_MAX17048_INT, INPUT_PULLUP);
 
   pinMode(PIN_DS18B20_POWER, OUTPUT);
@@ -631,7 +624,8 @@ void setup() {
                 static_cast<unsigned long>(TEMP_INTERVAL_MS / 1000UL));
   Serial.printf("Battery/MAX17048 interval: %lu seconds.\n",
                 static_cast<unsigned long>(BATTERY_INTERVAL_MS / 1000UL));
-  Serial.println("Zigbee battery percentage: enabled on Power Configuration cluster 0x0001.");
+  Serial.println("Zigbee Power Configuration cluster: enabled on endpoint 10.");
+  Serial.println("Explicit battery report: disabled during safe validation.");
   Serial.println("Deep sleep: disabled until real-battery validation.");
   Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
 
@@ -668,7 +662,7 @@ void loop() {
 
   if (now - lastBatteryMs >= BATTERY_INTERVAL_MS) {
     lastBatteryMs = now;
-    publishBatteryFromMax17048(false);
+    updateBatteryAttributesFromMax17048(false);
     if (SKIMMERSENSE_DEBUG) {
       reportMax17048();
     }
