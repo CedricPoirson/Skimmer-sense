@@ -37,14 +37,14 @@ static constexpr uint8_t MAX17048_REG_CRATE = 0x16;
 static constexpr uint8_t MAX17048_REG_STATUS = 0x1A;
 
 // STATUS register bits (first byte at address 0x1A).
-static constexpr uint8_t MAX17048_STATUS_SC = 0x20;  // SOC changed by 1%
-static constexpr uint8_t MAX17048_STATUS_HD = 0x10;  // SOC low
-static constexpr uint8_t MAX17048_STATUS_VR = 0x08;  // voltage reset
-static constexpr uint8_t MAX17048_STATUS_VL = 0x04;  // voltage low
-static constexpr uint8_t MAX17048_STATUS_VH = 0x02;  // voltage high
-static constexpr uint8_t MAX17048_STATUS_RI = 0x01;  // reset indicator
+static constexpr uint8_t MAX17048_STATUS_SC = 0x20;
+static constexpr uint8_t MAX17048_STATUS_HD = 0x10;
+static constexpr uint8_t MAX17048_STATUS_VR = 0x08;
+static constexpr uint8_t MAX17048_STATUS_VL = 0x04;
+static constexpr uint8_t MAX17048_STATUS_VH = 0x02;
+static constexpr uint8_t MAX17048_STATUS_RI = 0x01;
 
-// CONFIG.ALRT is bit 5 of the low byte of the 16-bit CONFIG register.
+// CONFIG low byte: bit 5 is ALRT, bits 4:0 are ATHD.
 static constexpr uint16_t MAX17048_CONFIG_ALRT = 0x0020;
 
 // Zigbee endpoints
@@ -143,20 +143,38 @@ void printMax17048Status(uint8_t status) {
   Serial.println();
 }
 
-void acknowledgeMax17048StartupAlert() {
+void printMax17048Config() {
+  uint16_t config = 0;
+  if (!readMax17048Register16(MAX17048_REG_CONFIG, config)) {
+    Serial.println("MAX17048 CONFIG: read failed");
+    return;
+  }
+
+  const uint8_t rcomp = static_cast<uint8_t>(config >> 8);
+  const uint8_t low = static_cast<uint8_t>(config & 0xFF);
+  const uint8_t athd = low & 0x1F;
+
+  Serial.printf(
+      "MAX17048 CONFIG=0x%04X | RCOMP=0x%02X | ALRT=%s | ATHD(raw)=%u\n",
+      config,
+      rcomp,
+      (config & MAX17048_CONFIG_ALRT) ? "SET" : "clear",
+      athd);
+}
+
+void acknowledgeMax17048Alert() {
   uint16_t rawStatus = 0;
   uint16_t config = 0;
 
   if (!readMax17048Register16(MAX17048_REG_STATUS, rawStatus) ||
       !readMax17048Register16(MAX17048_REG_CONFIG, config)) {
-    Serial.println("MAX17048: unable to read STATUS/CONFIG for startup acknowledge");
+    Serial.println("MAX17048: unable to read STATUS/CONFIG for acknowledge");
     return;
   }
 
   const uint8_t status = static_cast<uint8_t>(rawStatus >> 8);
 
-  // RI is expected after power-up. Clear only RI here; leave any genuine
-  // voltage/SOC alert cause untouched so it remains diagnosable.
+  // RI is expected after a power-up/reset of the gauge.
   if (status & MAX17048_STATUS_RI) {
     const uint16_t clearedStatus =
         rawStatus & ~(static_cast<uint16_t>(MAX17048_STATUS_RI) << 8);
@@ -168,24 +186,29 @@ void acknowledgeMax17048StartupAlert() {
     Serial.println("MAX17048: STATUS.RI cleared");
   }
 
-  // The ALRT pin stays LOW until CONFIG.ALRT is cleared by software.
   if (config & MAX17048_CONFIG_ALRT) {
-    if (!writeMax17048Register16(MAX17048_REG_CONFIG,
-                                 config & ~MAX17048_CONFIG_ALRT)) {
+    const uint16_t newConfig = config & ~MAX17048_CONFIG_ALRT;
+    Serial.printf("MAX17048: clearing CONFIG.ALRT: 0x%04X -> 0x%04X\n",
+                  config, newConfig);
+
+    if (!writeMax17048Register16(MAX17048_REG_CONFIG, newConfig)) {
       Serial.println("MAX17048: failed to clear CONFIG.ALRT");
       return;
     }
     Serial.println("MAX17048: CONFIG.ALRT acknowledged");
+  } else {
+    Serial.println("MAX17048: CONFIG.ALRT already clear");
   }
 
-  delay(10);
+  delay(20);
   lastMax17048Int = digitalRead(PIN_MAX17048_INT);
   Serial.printf("MAX17048 INT after acknowledge: %s\n",
                 max17048IntState(lastMax17048Int));
 }
 
 void reportMax17048() {
-  Serial.printf("MAX17048 INT: %s\n", max17048IntState(digitalRead(PIN_MAX17048_INT)));
+  Serial.printf("MAX17048 INT: %s\n",
+                max17048IntState(digitalRead(PIN_MAX17048_INT)));
 
   if (!i2cDevicePresent(MAX17048_I2C_ADDRESS)) {
     Serial.println("MAX17048: no response on I2C address 0x36");
@@ -202,14 +225,13 @@ void reportMax17048() {
 
   uint16_t rawStatus = 0;
   if (readMax17048Register16(MAX17048_REG_STATUS, rawStatus)) {
-    const uint8_t status = static_cast<uint8_t>(rawStatus >> 8);
-    printMax17048Status(status);
+    printMax17048Status(static_cast<uint8_t>(rawStatus >> 8));
   } else {
     Serial.println("MAX17048: STATUS register read failed");
   }
 
-  // Adafruit's reference driver considers the device ready only when
-  // (VERSION & 0xFFF0) == 0x0010. Without a battery it may read 0xFFFF.
+  printMax17048Config();
+
   if ((version & 0xFFF0) != 0x0010) {
     Serial.println("MAX17048: gauge not ready (battery probably not connected)");
     return;
@@ -228,7 +250,8 @@ void reportMax17048() {
 
   const float voltage = static_cast<float>(rawVcell) * 78.125f / 1000000.0f;
   const float soc = static_cast<float>(rawSoc) / 256.0f;
-  const float chargeRate = static_cast<float>(static_cast<int16_t>(rawCrate)) * 0.208f;
+  const float chargeRate =
+      static_cast<float>(static_cast<int16_t>(rawCrate)) * 0.208f;
 
   Serial.printf(
       "MAX17048 | voltage: %.3f V | SOC: %.1f %% | rate: %.2f %%/h\n",
@@ -236,7 +259,6 @@ void reportMax17048() {
 }
 
 float readWaterTemperatureC() {
-  // The DS18B20 pull-up resistor is between D2 (V) and D3 (DATA).
   pinMode(PIN_DS18B20_POWER, OUTPUT);
   digitalWrite(PIN_DS18B20_POWER, HIGH);
   delay(20);
@@ -249,12 +271,10 @@ float readWaterTemperatureC() {
     return DEVICE_DISCONNECTED_C;
   }
 
-  // 10 bits = 0.25 C resolution and about 188 ms conversion time.
   temperatureSensors.setResolution(10);
   temperatureSensors.requestTemperatures();
   const float temperatureC = temperatureSensors.getTempCByIndex(0);
 
-  // Avoid back-powering the sensor while it is switched off.
   pinMode(PIN_DS18B20_DATA, INPUT);
   digitalWrite(PIN_DS18B20_POWER, LOW);
 
@@ -272,8 +292,8 @@ void publishLowFloat(bool rawState, bool force = false) {
 
   initialized = true;
   lastPublishedClosed = closed;
-
   zbLowLevel.setBinaryInput(closed);
+
   if (Zigbee.connected()) {
     zbLowLevel.reportBinaryInput();
   }
@@ -290,8 +310,8 @@ void publishHighFloat(bool rawState, bool force = false) {
 
   initialized = true;
   lastPublishedClosed = closed;
-
   zbHighLevel.setBinaryInput(closed);
+
   if (Zigbee.connected()) {
     zbHighLevel.reportBinaryInput();
   }
@@ -384,7 +404,7 @@ void setup() {
   pinMode(PIN_FACTORY_RESET, INPUT_PULLUP);
   pinMode(PIN_FLOAT_LOW, INPUT_PULLUP);
   pinMode(PIN_FLOAT_HIGH, INPUT_PULLUP);
-  // MAX17048 INT/ALRT is open-drain and the breakout provides the pull-up.
+  // MAX17048 INT/ALRT is open-drain; breakout is expected to provide pull-up.
   pinMode(PIN_MAX17048_INT, INPUT);
 
   pinMode(PIN_DS18B20_POWER, OUTPUT);
@@ -400,17 +420,17 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" SkimmerSense v0.7 - MAX17048 alert ack");
+  Serial.println(" SkimmerSense v0.8 - MAX17048 CONFIG diag");
   Serial.println(" XIAO ESP32-C6 / Zigbee End Device");
   Serial.println("========================================");
   Serial.printf("Float LOW : %s\n", contactState(lastLowRaw));
   Serial.printf("Float HIGH: %s\n", contactState(lastHighRaw));
   Serial.printf("MAX17048 INT: %s\n", max17048IntState(lastMax17048Int));
 
-  // First show the latched cause, then clear only the expected startup RI and
-  // acknowledge CONFIG.ALRT. Any genuine voltage/SOC flags remain untouched.
+  // Startup attempt can be lost from the USB monitor; a second visible
+  // diagnostic is deliberately performed after Zigbee has connected.
   reportMax17048();
-  acknowledgeMax17048StartupAlert();
+  acknowledgeMax17048Alert();
 
   configureZigbeeEndpoints();
   startZigbee();
@@ -422,8 +442,20 @@ void setup() {
   Serial.println("SkimmerSense is online.");
   Serial.println("Temperature interval: 60 seconds (test mode).");
   Serial.println("MAX17048 telemetry interval: 30 seconds.");
-  Serial.println("MAX17048 INT/STATUS diagnostic enabled.");
+  Serial.println("MAX17048 INT/STATUS/CONFIG diagnostic enabled.");
   Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
+
+  // Make the decisive diagnostic visible even when the USB CDC monitor
+  // misses the first lines during reset/re-enumeration.
+  delay(2000);
+  Serial.println();
+  Serial.println("--- MAX17048 POST-ZIGBEE DIAGNOSTIC ---");
+  reportMax17048();
+  acknowledgeMax17048Alert();
+  printMax17048Config();
+  Serial.printf("GPIO4 / MAX17048 INT final: %s\n",
+                max17048IntState(digitalRead(PIN_MAX17048_INT)));
+  Serial.println("--- END MAX17048 DIAGNOSTIC ---");
 }
 
 void loop() {
@@ -450,7 +482,8 @@ void loop() {
   const bool max17048Int = digitalRead(PIN_MAX17048_INT);
   if (max17048Int != lastMax17048Int) {
     lastMax17048Int = max17048Int;
-    Serial.printf("MAX17048 INT changed: %s\n", max17048IntState(max17048Int));
+    Serial.printf("MAX17048 INT changed: %s\n",
+                  max17048IntState(max17048Int));
   }
 
   if (now - lastTemperatureMs >= TEMP_INTERVAL_MS) {
