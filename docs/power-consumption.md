@@ -1,106 +1,149 @@
 # Power Consumption Notes
 
-SkimmerSense is intended to become a battery-powered sleepy Zigbee end device. The current firmware is still a validation build and deliberately stays awake so sensor and Zigbee behavior can be observed over USB serial.
+SkimmerSense now has a hardware-validated sleepy Zigbee / deep-sleep production-candidate firmware. The remaining power work is measurement and optimization, not basic sleep implementation.
 
-## Current development behavior
+## Current production-candidate behavior
 
-The prototype currently:
+The production PlatformIO environment is:
 
-- remains awake continuously
-- samples water temperature frequently for validation
-- reads MAX17048 diagnostics frequently
-- reports float changes immediately
-- keeps serial diagnostics enabled
+```text
+seeed_xiao_esp32c6_sleep_zigbee_production
+```
 
-This behavior is intentionally unsuitable for final battery life.
+Current timing profile:
 
-## Production strategy
+- periodic NORMAL refresh: 1800 s / 30 min
+- LOW confirmation: 300 s / 5 min
+- WAIT_HIGH fallback: 120 s / 2 min
+- bounded Zigbee reconnect wait: 10 s
 
-The production firmware should minimize both ESP32-C6 awake time and unnecessary radio traffic:
+The firmware:
 
-- keep the ESP32-C6 asleep whenever possible
-- use a sleepy Zigbee End Device design
-- wake periodically for temperature and battery reporting
-- wake immediately on meaningful float-state changes
-- evaluate MAX17048 INT/ALRT on GPIO4 as a low-battery wake source
-- power the DS18B20 only during measurement
-- put the DS18B20 data GPIO in high-impedance state before sleeping
-- avoid periodic reports when the value has not changed enough to be useful
-- avoid indefinite Zigbee join/reconnect loops while running from battery
-- cut or disable any permanently-on breakout LEDs
+- sleeps between useful events
+- powers the DS18B20 only for a measurement
+- places the DS18B20 data pin in high-impedance state before sleep
+- wakes on the LOW float while in `NORMAL`
+- uses timer-only LOW confirmation to reject waves / bather motion
+- ignores LOW transitions while waiting for the HIGH float
+- wakes on HIGH opening while in `WAIT_HIGH`
+- arms MAX17048 INT/ALRT on GPIO4 where applicable
+- performs periodic temperature/float refreshes rather than staying continuously awake
 
-## Intended wake sources
+## Anti-wave wake strategy
 
-Current pin allocation leaves the important event inputs on GPIOs suitable for low-power wake evaluation:
+The RTC-retained state machine is:
 
-| GPIO | Source |
-|---:|---|
-| GPIO0 / D0 | low-level float |
-| GPIO1 / D1 | high-level float |
-| GPIO4 / MTMS | MAX17048 INT/ALRT |
+```text
+NORMAL
+  -> LOW_PENDING
+  -> WAIT_HIGH
+  -> NORMAL
+```
 
-The exact wake implementation must account for level-triggered wake behavior. A float that remains in the active level must not cause an immediate wake/sleep loop.
+This avoids repeated wakeups caused by water movement:
 
-A state-aware wake mask or equivalent logic should be used so the next wake is configured for the opposite transition expected from each current float state.
+- a LOW closure wakes immediately
+- confirmation then happens during a timer-only sleep
+- if LOW reopens, the event is rejected
+- after a confirmed low level, LOW is ignored
+- only HIGH opening is relevant for normal refill completion
 
-## Periodic reporting
+Two pre-sleep races are also handled:
 
-The final interval should be chosen from measured energy use and practical pool-monitoring needs rather than fixed in advance.
+- LOW closes while Zigbee is still awake -> switch directly to `LOW_PENDING`
+- HIGH opens while Zigbee is still awake in `WAIT_HIGH` -> force a one-second timer-only resample
 
-Reasonable initial candidates for field testing are:
+## Wake sources
 
-- water temperature: every 30-60 minutes
-- battery SOC: every 1-6 hours, or piggybacked on a temperature wake
-- float changes: event-driven as quickly as practical
+| GPIO | Source | Current status |
+|---:|---|---|
+| GPIO0 / D0 | low-level float | validated hardware wake |
+| GPIO1 / D1 | high-level float | validated hardware wake in `WAIT_HIGH` |
+| GPIO4 / MTMS | MAX17048 INT/ALRT | armed by firmware; real low-battery ALRT wake still to validate |
 
-The current 60-second temperature and 30-second MAX17048 debug intervals are for bench testing only.
+The ESP32-C6 EXT1 wake implementation uses state-aware per-pin wake levels so a contact that remains in its current state does not create a wake/sleep loop.
+
+## Zigbee behavior and its energy impact
+
+The current Arduino-ESP32 / ZBOSS stack crashes if the firmware mutates certain Zigbee attributes at runtime and lets automatic reporting process them.
+
+The validated low-power workaround is therefore:
+
+1. wake and read sensors
+2. preload Zigbee attributes before `Zigbee.begin()`
+3. reconnect with a bounded wait
+4. send explicit zero-initialized reports for temperature and/or float states
+5. skip explicit battery reporting
+6. wait briefly for delivery
+7. return to deep sleep
+
+`BatteryPercentageRemaining` is intentionally not explicitly reported because that path reproducibly asserts in the current ZBOSS version. Battery attributes are still preloaded into the Power Configuration cluster.
 
 ## DS18B20 optimization
 
-Current wiring already supports switched sensor power:
+Current sequence:
 
 1. D2 HIGH powers the DS18B20
 2. wait briefly for sensor startup
 3. perform a 10-bit conversion
 4. read the result
-5. put the data pin in high-impedance mode
+5. put D3 / DATA in high-impedance mode
 6. drive D2 LOW before sleep
 
-10-bit resolution is sufficient for pool-water monitoring and reduces conversion time compared with 12-bit operation.
+10-bit resolution is sufficient for pool-water monitoring and reduces awake time compared with 12-bit conversion.
 
 ## MAX17048 considerations
 
-The MAX17048 itself is intended to remain connected to the cell while the ESP32 sleeps.
+The MAX17048 remains connected while the ESP32 sleeps.
 
-Before optimizing firmware around its alert signal, validate with the real protected 18650 installed:
+Validated so far:
 
-- VCELL plausibility
-- SOC plausibility
-- CRATE behavior
-- STATUS flags
-- CONFIG.ALRT behavior
-- physical INT/ALRT voltage and GPIO reading
+- I2C address `0x36`
+- VERSION `0x0012`
+- VCELL and SOC reads
+- raw SOC diagnostics
+- Zigbee-facing SOC clamp to 0-100%
+- INT/ALRT wiring to GPIO4 / MTMS
+- inactive INT observed HIGH
+- alert acknowledge logic
 
-USB-only readings with no battery installed are not valid for autonomy estimates.
+Still to validate with the final protected 18650:
+
+- VCELL against a multimeter
+- SOC plausibility through a real discharge cycle
+- a real low-battery threshold / ALRT wake
+- long-duration behavior on battery only
 
 ## Battery target
 
-Initial battery: protected 18650 Li-ion, approximately 3500 mAh.
+Initial battery target: protected 1S 18650 Li-ion, approximately 3500 mAh.
 
-Battery-life estimates should be based on measured current in all important states:
+A USB power bank connected to USB-C is **not** representative of the final battery setup: many power banks switch off when the ESP32 enters deep sleep because the load current becomes too small.
 
-1. deep/sleep state
-2. periodic wake without Zigbee retry
-3. DS18B20 measurement
-4. normal Zigbee report
-5. float-event wake and report
-6. MAX17048 alert wake
-7. Zigbee reconnect/rejoin attempt
-8. USB charging / battery-only operation as separate cases
+The intended final supply is the 1S Li-ion battery path on the XIAO, not a conventional auto-off USB power bank.
+
+## Measurements still required
+
+No final autonomy figure should be published until the assembled device is measured.
+
+Measure current and duration for at least:
+
+1. deep-sleep state
+2. periodic 30-minute wake and report
+3. DS18B20 conversion
+4. normal Zigbee reconnect/report cycle
+5. LOW event wake followed by confirmation sleep
+6. confirmed LOW report and `WAIT_HIGH` entry
+7. HIGH event wake and final report
+8. MAX17048 alert wake
+9. failed Zigbee reconnect attempt
+10. battery-only and USB-charging cases separately
+
+Also remove avoidable hardware loads, especially any permanently-on LED on the MAX17048 breakout, before final sleep-current measurement.
 
 ## Measurement model
 
-Once the firmware can sleep reliably, record current and duration for each state and calculate average current from the measured duty cycle:
+Calculate average current from the measured duty cycle:
 
 ```text
 Iavg = sum(I_state x time_state) / total_time
@@ -112,14 +155,14 @@ Then estimate ideal battery life:
 hours ~= usable_capacity_mAh / Iavg_mA
 ```
 
-The practical field estimate should then include margin for:
+The practical field estimate should include margin for:
 
 - cell self-discharge
-- cold/hot outdoor temperatures
+- outdoor temperature
 - battery aging
 - Zigbee retransmissions
 - coordinator/network outages
 - regulator and charger leakage
-- breakout LEDs or pull-ups
+- breakout LEDs and pull-ups
 
-The goal is not a theoretical multi-year number from datasheets; it is a conservative autonomy estimate measured on the assembled SkimmerSense hardware.
+The target is a conservative autonomy estimate measured on the complete SkimmerSense hardware, not a theoretical figure derived only from component datasheets.
