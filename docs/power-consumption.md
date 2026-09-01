@@ -13,8 +13,8 @@ seeed_xiao_esp32c6_sleep_zigbee_production
 Current timing profile:
 
 - periodic NORMAL refresh: 1800 s / 30 min
-- LOW confirmation: 300 s / 5 min
-- WAIT_HIGH fallback: 120 s / 2 min
+- LOW confirmation: 300 s / 5 min continuously CLOSED
+- WAIT_HIGH fallback: 1800 s / 30 min
 - bounded Zigbee reconnect wait: 10 s
 
 The firmware:
@@ -23,7 +23,8 @@ The firmware:
 - powers the DS18B20 only for a measurement
 - places the DS18B20 data pin in high-impedance state before sleep
 - wakes on the LOW float while in `NORMAL`
-- uses timer-only LOW confirmation to reject waves / bather motion
+- during `LOW_PENDING`, watches for LOW to reopen and immediately cancels the confirmation if it does
+- validates LOW only after the full uninterrupted 5-minute timer window
 - ignores LOW transitions while waiting for the HIGH float
 - wakes on HIGH opening while in `WAIT_HIGH`
 - arms MAX17048 INT/ALRT on GPIO4 where applicable
@@ -40,25 +41,28 @@ NORMAL
   -> NORMAL
 ```
 
-This avoids repeated wakeups caused by water movement:
+This rejects short LOW closures caused by waves or bather motion:
 
 - a LOW closure wakes immediately
-- confirmation then happens during a timer-only sleep
-- if LOW reopens, the event is rejected
+- `LOW_PENDING` starts a confirmation timer and arms LOW for the opposite transition
+- if LOW reopens before the timer expires, the GPIO wake rejects the event immediately and returns to `NORMAL`
+- only a timer wake after a full uninterrupted confirmation window can validate LOW
 - after a confirmed low level, LOW is ignored
-- only HIGH opening is relevant for normal refill completion
+- HIGH opening remains event-driven and completes the level cycle immediately
+
+The WAIT_HIGH fallback is intentionally 30 minutes. A confirmed low-water request can remain pending for hours until Home Assistant reaches the allowed overnight refill window; there is no need to wake every two minutes while waiting. HIGH opening still wakes immediately, so the longer fallback does not delay refill completion.
 
 Two pre-sleep races are also handled:
 
-- LOW closes while Zigbee is still awake -> switch directly to `LOW_PENDING`
+- LOW becomes meaningfully CLOSED while the device is still awake -> start/restart `LOW_PENDING` only when both floats are physically consistent with low water
 - HIGH opens while Zigbee is still awake in `WAIT_HIGH` -> force a one-second timer-only resample
 
 ## Wake sources
 
 | GPIO | Source | Current status |
 |---:|---|---|
-| GPIO0 / D0 | low-level float | validated hardware wake |
-| GPIO1 / D1 | high-level float | validated hardware wake in `WAIT_HIGH` |
+| GPIO0 / D0 | low-level float | validated hardware wake in `NORMAL` and reopen wake in `LOW_PENDING` |
+| GPIO1 / D1 | high-level float | validated hardware wake in `WAIT_HIGH`; also watched in impossible fault state |
 | GPIO4 / MTMS | MAX17048 INT/ALRT | armed by firmware; real low-battery ALRT wake still to validate |
 
 The ESP32-C6 EXT1 wake implementation uses state-aware per-pin wake levels so a contact that remains in its current state does not create a wake/sleep loop.
@@ -70,14 +74,15 @@ The current Arduino-ESP32 / ZBOSS stack crashes if the firmware mutates certain 
 The validated low-power workaround is therefore:
 
 1. wake and read sensors
-2. preload Zigbee attributes before `Zigbee.begin()`
+2. preload temperature and float attributes before `Zigbee.begin()`
 3. reconnect with a bounded wait
 4. send explicit zero-initialized reports for temperature and/or float states
-5. skip explicit battery reporting
-6. wait briefly for delivery
-7. return to deep sleep
+5. keep Zigbee Power Configuration setup disabled
+6. skip explicit battery reporting
+7. wait briefly for delivery
+8. return to deep sleep
 
-`BatteryPercentageRemaining` is intentionally not explicitly reported because that path reproducibly asserts in the current ZBOSS version. Battery attributes are still preloaded into the Power Configuration cluster.
+During isolation, explicit `BatteryPercentageRemaining` reporting reproducibly asserted in the current ZBOSS version. `ZigbeeTempSensor::setPowerSource(...)` also caused a crash in this firmware configuration. MAX17048 voltage/SOC monitoring therefore remains local to the firmware/serial diagnostics for now.
 
 ## DS18B20 optimization
 
@@ -102,7 +107,7 @@ Validated so far:
 - VERSION `0x0012`
 - VCELL and SOC reads
 - raw SOC diagnostics
-- Zigbee-facing SOC clamp to 0-100%
+- local SOC clamp to 0-100% for diagnostics/future Zigbee use
 - INT/ALRT wiring to GPIO4 / MTMS
 - inactive INT observed HIGH
 - alert acknowledge logic
@@ -132,12 +137,14 @@ Measure current and duration for at least:
 2. periodic 30-minute wake and report
 3. DS18B20 conversion
 4. normal Zigbee reconnect/report cycle
-5. LOW event wake followed by confirmation sleep
-6. confirmed LOW report and `WAIT_HIGH` entry
-7. HIGH event wake and final report
-8. MAX17048 alert wake
-9. failed Zigbee reconnect attempt
-10. battery-only and USB-charging cases separately
+5. LOW event wake followed by `LOW_PENDING`
+6. LOW reopen wake during the 5-minute confirmation window
+7. confirmed LOW report and `WAIT_HIGH` entry
+8. 30-minute WAIT_HIGH fallback wake
+9. HIGH event wake and final report
+10. MAX17048 alert wake
+11. failed Zigbee reconnect attempt
+12. battery-only and USB-charging cases separately
 
 Also remove avoidable hardware loads, especially any permanently-on LED on the MAX17048 breakout, before final sleep-current measurement.
 
