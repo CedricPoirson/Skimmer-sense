@@ -26,14 +26,37 @@ Validated on the current XIAO ESP32-C6 prototype:
 - Home Assistant receives temperature and both float states
 - Home Assistant level-state synthesis and dry-contact IPX800 V4 refill-control logic
 - independent Home Assistant and IPX800 maximum-open safety timers
+- temperature-adaptive periodic wake in `NORMAL`
+- immediate LOW GPIO wake remains functional while a long adaptive timer is armed
+- production `WAIT_HIGH` 30-minute fallback remains independent from the adaptive `NORMAL` timer
+- HIGH GPIO wake returns immediately from `WAIT_HIGH` to `NORMAL` and resumes the correct adaptive interval
 
-Production-candidate timing profile:
+### Production-candidate timing profile
 
-- normal periodic refresh: **30 min**
+The periodic refresh in `NORMAL` is now selected from the measured water temperature:
+
+| Water temperature | Periodic `NORMAL` wake |
+|---|---:|
+| >= 28 C | 30 min |
+| 24 to < 28 C | 1 h |
+| 18 to < 24 C | 2 h |
+| 12 to < 18 C | 4 h |
+| 5 to < 12 C | 6 h |
+| 3 to < 5 C | 2 h |
+| < 3 C | 30 min |
+
+If the DS18B20 reading is invalid, production falls back to `SKIMMERSENSE_NORMAL_TIMER_SECONDS` (currently 30 min).
+
+The other state-machine timings remain fixed:
+
 - LOW-level confirmation: **5 min continuously CLOSED**
 - WAIT_HIGH fallback check: **30 min**
 
-GPIO events remain immediate; the 30-minute timers do not delay LOW detection or HIGH-level completion.
+GPIO events remain immediate. A multi-hour `NORMAL` timer does **not** delay LOW detection, and the 30-minute WAIT_HIGH fallback does **not** delay HIGH-level completion.
+
+The adaptive profile has been exercised on the real prototype at 24.50 C: production selected 3600 s / 1 h, LOW still woke immediately, the full 5-minute confirmation entered `WAIT_HIGH`, the 30-minute fallback behaved correctly, and HIGH opening returned immediately to `NORMAL` with the 3600 s interval restored.
+
+Because the production profile can sleep for up to 6 hours, the Zigbee End Device aging timeout is explicitly set to `ESP_ZB_ED_AGING_TIMEOUT_2048MIN` (about 34 hours), rather than relying on the shorter framework default.
 
 Still to validate before merging v0.9 to `main`:
 
@@ -175,6 +198,7 @@ Important behavior validated on hardware:
 - the WAIT_HIGH timer is **30 min** only as a fallback/periodic check while a refill request may remain pending for hours
 - if HIGH changes while Zigbee is still awake just before sleep, the firmware forces a 1-second resample rather than waiting for the fallback timer
 - in `NORMAL`, `LOW=CLOSED / HIGH=OPEN` is published as an impossible/fault state and does not enter `LOW_PENDING`
+- the adaptive temperature timer only changes periodic `NORMAL` refreshes; it does not modify `LOW_PENDING` or `WAIT_HIGH`
 
 ## Zigbee reporting workaround
 
@@ -206,6 +230,17 @@ Current safe behavior:
 - explicit battery reporting is disabled
 
 This is an intentional workaround, not a missing call. Battery monitoring remains local through the MAX17048 until a framework version is verified to fix the ZBOSS issue.
+
+### Sleepy End Device aging timeout
+
+The longest adaptive `NORMAL` interval is 6 hours. The production firmware therefore configures:
+
+```cpp
+zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout =
+    ESP_ZB_ED_AGING_TIMEOUT_2048MIN;
+```
+
+This gives roughly 34 hours before child aging, providing substantial margin over the longest planned sleep interval and over isolated missed reconnect/report cycles.
 
 ## Refill safety concept
 
@@ -241,15 +276,17 @@ pio device monitor
 
 Do **not** erase flash/NVS during routine updates. A normal flash preserves the existing Zigbee pairing; an explicit erase can destroy network state and require pairing again.
 
-The production environment uses:
+The production environment keeps these fixed state-machine values:
 
 ```text
-SKIMMERSENSE_NORMAL_TIMER_SECONDS     = 1800
+SKIMMERSENSE_NORMAL_TIMER_SECONDS     = 1800   # conservative fallback / invalid temperature
 SKIMMERSENSE_LOW_CONFIRM_SECONDS      = 300
 SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS  = 1800
 ```
 
-The shorter anti-wave environment remains available for bench testing.
+`normalSleepSecondsForTemperature()` overrides the first value only for healthy production `NORMAL` operation when a valid DS18B20 measurement is available.
+
+The shorter anti-wave environment remains available for bench testing and continues to use its fixed short timer rather than the adaptive production schedule.
 
 ## Repository layout
 
@@ -291,7 +328,10 @@ Skimmer-sense/
 - [x] anti-wave `NORMAL / LOW_PENDING / WAIT_HIGH` state machine
 - [x] continuous 5-minute LOW confirmation with immediate cancellation on reopen
 - [x] impossible float-state handling in `NORMAL`
-- [x] production timing profile: 30 min / 5 min / 30 min
+- [x] WAIT_HIGH production fallback: 30 min
+- [x] temperature-adaptive `NORMAL` periodic wake: 30 min to 6 h
+- [x] immediate LOW/HIGH event wake validated with adaptive timing enabled
+- [x] Zigbee End Device aging timeout extended to 2048 min
 - [x] isolate and document the ZBOSS runtime-reporting crash
 - [x] isolate and document the Zigbee Power Configuration / battery-report crash
 - [ ] protected 18650 battery-only validation
