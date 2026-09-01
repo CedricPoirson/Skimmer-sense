@@ -13,11 +13,14 @@ The current branch now contains the hardware-validated deep-sleep / anti-wave pr
 - sleepy Zigbee End Device operation validated across repeated deep-sleep cycles
 - RTC-retained level state machine added: `NORMAL -> LOW_PENDING -> WAIT_HIGH -> NORMAL`
 - LOW float closure wakes the XIAO immediately from `NORMAL`
-- transient LOW closure is rejected after the confirmation delay
+- LOW confirmation now requires a full uninterrupted 5-minute CLOSED interval
+- while in `LOW_PENDING`, LOW reopening wakes immediately and rejects the event as wave/bather motion
 - confirmed low level publishes `ON/ON` and enters `WAIT_HIGH`
 - LOW transitions are deliberately ignored while in `WAIT_HIGH`
-- HIGH opening wakes immediately, publishes LOW first then HIGH, and returns to `NORMAL`
-- pre-sleep LOW race handled by switching directly to `LOW_PENDING`
+- HIGH opening wakes immediately, publishes final float states and returns to `NORMAL`
+- impossible `LOW=CLOSED / HIGH=OPEN` in `NORMAL` is published as a fault and does not enter `LOW_PENDING`
+- impossible-state wake monitors both float inputs so a return to a valid state can wake promptly
+- pre-sleep LOW race is handled only when both float readings are physically consistent with low water
 - pre-sleep HIGH race handled by a one-second timer-only resample
 - MAX17048 INT/ALRT is armed as an EXT1 wake source where applicable; a real low-battery alert wake still needs hardware validation
 
@@ -26,32 +29,38 @@ The current branch now contains the hardware-validated deep-sleep / anti-wave pr
 `seeed_xiao_esp32c6_sleep_zigbee_production` currently uses:
 
 - periodic NORMAL refresh: 1800 s / 30 min
-- LOW confirmation: 300 s / 5 min
-- WAIT_HIGH fallback: 120 s / 2 min
+- LOW confirmation: 300 s / 5 min continuously CLOSED
+- WAIT_HIGH fallback: 1800 s / 30 min
 - bounded Zigbee reconnect wait: 10 s
+
+The 30-minute WAIT_HIGH fallback does not delay completion: HIGH opening remains GPIO event-driven and wakes immediately. The longer fallback avoids unnecessary battery use when a confirmed low-water request remains pending for hours before the overnight refill window.
 
 ### Zigbee / ZBOSS workaround
 
-A crash in the current Arduino-ESP32 / ZBOSS stack was isolated to automatic reporting after runtime attribute mutation.
+A crash in the current Arduino-ESP32 / ZBOSS stack was isolated to automatic reporting after runtime attribute mutation and to Power Configuration setup/reporting in this firmware configuration.
 
 Validated workaround:
 
 - read the real sensor snapshot before `Zigbee.begin()`
-- preload temperature, float and battery attributes before the Zigbee stack starts
+- preload temperature and float attributes before the Zigbee stack starts
 - avoid runtime Arduino Zigbee attribute mutation
 - send zero-initialized explicit reports for temperature and float states only
+- keep `ZigbeeTempSensor::setPowerSource(...)` disabled
 - do **not** explicitly report `BatteryPercentageRemaining`
 
-An explicit battery report reproducibly asserts in `esp_zigbee_zcl_command.c:263`, including when addressed directly to the coordinator. The battery Power Configuration attributes remain preloaded, but reliable active battery reporting is intentionally disabled until the upstream stack issue is resolved.
+An explicit battery report reproducibly asserts in `esp_zigbee_zcl_command.c:263`, including when addressed directly to the coordinator. `setPowerSource(...)` also produced a reproducible ZBOSS crash. MAX17048 voltage/SOC monitoring remains available locally/over serial, but reliable active Zigbee battery reporting is intentionally disabled until the upstream stack issue is resolved.
 
 ### Hardware validation completed
 
 - existing Zigbee pairing survives normal flashing
 - DS18B20 switched-power measurement works in the sleep build
 - LOW/HIGH float wake and report sequence validated end to end
+- LOW reopen during `LOW_PENDING` validated as an immediate EXT1 wake and confirmation cancellation
+- full uninterrupted confirmation validated before transition to `WAIT_HIGH`
+- `LOW=CLOSED / HIGH=OPEN` fault handling validated in `NORMAL`
 - MAX17048 I2C address `0x36` and VERSION `0x0012` validated
 - MAX17048 INT wiring corrected to GPIO4 / MTMS and confirmed HIGH when inactive
-- raw SOC is retained for diagnostics while Zigbee-facing percentage is clamped to 0-100%
+- raw SOC is retained for diagnostics while locally clamped to 0-100% for future use
 - GitHub Actions build passes for the current production-candidate branch
 
 ### Remaining before merge to main
