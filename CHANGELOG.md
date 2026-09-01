@@ -73,6 +73,22 @@ The production build was exercised end to end on the real prototype at 24.50 C:
 - the cache is cleared on a real cold boot/reset
 - hardware validation observed `Water temperature: skipped for this wake` together with `Adaptive NORMAL timer: 7200 s (cached from 23.75 C)`
 
+### Zigbee active-time optimization
+
+The deliberate safety delays around each Zigbee reporting cycle were reduced after repeated hardware testing:
+
+| Timing | Previous | Validated v0.9 value |
+|---|---:|---:|
+| idle after reconnect | 8000 ms | 2000 ms |
+| delay between reports | 400 ms | 100 ms |
+| post-report wait | 2000 ms | 750 ms |
+
+For a full temperature + LOW + HIGH reporting cycle, these fixed waits fall from about 11.2 s to about 3.05 s, a reduction of roughly 73% in deliberate awake delay. The 10-second reconnect timeout remains unchanged because the reconnect loop exits as soon as the Zigbee End Device is connected.
+
+Hardware validation covered repeated 60-second anti-wave test cycles with all three reports, a `WAIT_HIGH` timer cycle with temperature-only reporting, a `WAIT_HIGH -> NORMAL` cycle with temperature + LOW + HIGH reporting, and a production cycle at 29.50 C. All tested reports continued to return `queued OK`, the firmware returned to deep sleep normally, and no ZBOSS assertion or Guru Meditation was observed.
+
+This optimization changes only the deliberate delays around the already-validated safe reporting path. It does not change endpoints, ZCL attributes, radio power, Zigbee child-aging timeout, or the existing ZBOSS Power Configuration workaround.
+
 ### Zigbee sleepy-child aging timeout
 
 Because adaptive `NORMAL` sleep can reach 6 hours, production now explicitly configures:
@@ -111,6 +127,7 @@ An explicit battery report reproducibly asserts in `esp_zigbee_zcl_command.c:263
 - MAX17048 INT wiring corrected to GPIO4 / MTMS and confirmed HIGH when inactive
 - raw SOC is retained for diagnostics while locally clamped to 0-100% for future use
 - production and anti-wave PlatformIO environments compile after the adaptive timing and selective DS18B20 changes
+- optimized Zigbee timing `2000 / 100 / 750 ms` validated across repeated anti-wave cycles and a production cycle
 - GitHub Actions build passes for the production-candidate branch prior to the latest documentation-only updates
 
 ### Remaining before merge to main
@@ -119,7 +136,7 @@ An explicit battery report reproducibly asserts in `esp_zigbee_zcl_command.c:263
 - trigger and validate a real MAX17048 low-battery ALRT wake
 - measure final deep-sleep and wake-cycle current
 - cut/disable any unnecessary MAX17048 breakout LED before final autonomy measurement
-- quantify battery life with the adaptive wake profile and selective DS18B20 reads
+- quantify battery life with the adaptive wake profile, selective DS18B20 reads and shortened Zigbee awake time
 - observe the production profile for several days, including 4-hour and 6-hour sleep intervals
 - verify Zigbee2MQTT/Home Assistant availability behavior across the longest sleeps
 - connect the real refill valve and run the first supervised water-fill cycle
