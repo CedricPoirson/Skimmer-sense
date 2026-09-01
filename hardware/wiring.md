@@ -53,11 +53,13 @@ The spacing between the two switches provides the refill hysteresis.
 
 The production-candidate firmware uses state-aware EXT1 wake behavior:
 
-- in `NORMAL`, GPIO0 / LOW is watched for the meaningful closure transition
-- during `LOW_PENDING`, float GPIO wake is disabled and the confirmation uses a timer only
-- in `WAIT_HIGH`, GPIO1 / HIGH is watched and LOW transitions are deliberately ignored
+- in `NORMAL`, GPIO0 / LOW is watched for the meaningful OPEN -> CLOSED transition
+- in `LOW_PENDING`, LOW is currently CLOSED and GPIO0 is armed for the opposite CLOSED -> OPEN transition; any reopening before the full 5-minute timer expires cancels confirmation immediately
+- only a timer wake after a full uninterrupted confirmation window can validate the low level
+- in `WAIT_HIGH`, GPIO1 / HIGH is watched for CLOSED -> OPEN and LOW transitions are deliberately ignored
+- in the impossible `LOW=CLOSED / HIGH=OPEN` fault state while `NORMAL`, both float GPIOs are watched so a return to a physically valid state can wake the device promptly
 
-Both LOW and HIGH float wake paths have been validated on the real XIAO ESP32-C6.
+Both LOW and HIGH float wake paths, including LOW reopening during `LOW_PENDING`, have been validated on the real XIAO ESP32-C6.
 
 ## DS18B20
 
@@ -104,6 +106,8 @@ GPIO4 must **not** be connected to `QSTRT`. An earlier bench wiring error connec
 `QSTRT` is not used by the firmware.
 
 The firmware can arm GPIO4 as a wake source and acknowledge MAX17048 alerts, but a real low-battery threshold causing an actual ALRT wake still needs to be validated with the final protected 18650.
+
+The current Zigbee Power Configuration setup is intentionally disabled because `setPowerSource()` caused a reproducible ZBOSS crash in this firmware configuration. MAX17048 monitoring therefore remains local/serial until that stack issue is resolved.
 
 ## Battery / charging
 
