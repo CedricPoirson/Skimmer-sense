@@ -134,6 +134,44 @@ During isolation, explicit `BatteryPercentageRemaining` reporting reproducibly a
 
 Because Zigbee reconnect/report cycles are much more expensive than deep sleep, the adaptive schedule should reduce average consumption substantially versus the previous fixed 30-minute periodic refresh. Selective DS18B20 reads also remove the roughly 10-bit conversion/startup cost from short event-only wakes. Final autonomy must still be based on measured current rather than on wake-count reduction alone.
 
+### Validated Zigbee active-time reduction
+
+The production candidate originally kept deliberately conservative pauses around each reporting cycle:
+
+```text
+post-connect idle     8000 ms
+between reports        400 ms
+post-report wait       2000 ms
+```
+
+After staged hardware testing, both the anti-wave and production environments now use:
+
+```text
+post-connect idle     2000 ms
+between reports        100 ms
+post-report wait        750 ms
+```
+
+For a full cycle that sends temperature + LOW + HIGH, the fixed deliberate waits therefore change from:
+
+```text
+8000 + 3 x 400 + 2000 = 11200 ms
+```
+
+to:
+
+```text
+2000 + 3 x 100 + 750 = 3050 ms
+```
+
+This is a reduction of about 8.15 s, or roughly 73%, in fixed awake delay per complete reporting cycle. The actual total awake time is longer because Zigbee startup/reconnect and sensor work still take time.
+
+The 10-second Zigbee reconnect timeout was intentionally left unchanged. It is only a maximum: the firmware exits the reconnect loop as soon as `Zigbee.connected()` becomes true, so reducing that timeout would not save energy during normal fast reconnects and would only reduce tolerance of a difficult reconnect.
+
+Hardware validation included repeated 60-second anti-wave `NORMAL` cycles with temperature + LOW + HIGH reports, `WAIT_HIGH` temperature-only reporting, `WAIT_HIGH -> NORMAL` reporting with all three values, and a production cycle at 29.50 C. All tested reports were accepted by the stack (`queued OK`), the device returned to deep sleep normally, and no assertion or Guru Meditation was observed.
+
+The optimization does not change radio power, endpoint layout, ZCL attribute types or Zigbee child-aging configuration. Those remain unchanged for v0.9.
+
 ## DS18B20 optimization
 
 When a fresh temperature is required, the sequence is:
@@ -190,7 +228,7 @@ No final autonomy figure should be published until the assembled device is measu
 Measure current and duration for at least:
 
 1. deep-sleep state
-2. a periodic adaptive `NORMAL` wake and report
+2. a periodic adaptive `NORMAL` wake and report using the validated 2000 / 100 / 750 ms Zigbee timing
 3. DS18B20 conversion
 4. normal Zigbee reconnect/report cycle
 5. LOW event wake followed by `LOW_PENDING` with DS18B20 intentionally skipped
