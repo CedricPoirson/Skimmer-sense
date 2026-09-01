@@ -10,25 +10,45 @@ The production PlatformIO environment is:
 seeed_xiao_esp32c6_sleep_zigbee_production
 ```
 
-Current timing profile:
+### Adaptive `NORMAL` wake profile
 
-- periodic NORMAL refresh: 1800 s / 30 min
+Periodic refresh is selected from the measured water temperature:
+
+| Water temperature | Periodic `NORMAL` wake |
+|---|---:|
+| >= 28 C | 1800 s / 30 min |
+| 24 to < 28 C | 3600 s / 1 h |
+| 18 to < 24 C | 7200 s / 2 h |
+| 12 to < 18 C | 14400 s / 4 h |
+| 5 to < 12 C | 21600 s / 6 h |
+| 3 to < 5 C | 7200 s / 2 h |
+| < 3 C | 1800 s / 30 min |
+
+If the DS18B20 reading is invalid, the production build falls back to `SKIMMERSENSE_NORMAL_TIMER_SECONDS`, currently 1800 s / 30 min.
+
+The U-shaped profile intentionally spends the least energy in moderate water temperatures while increasing observation frequency again for very warm water and close to freezing.
+
+The other production timings remain fixed:
+
 - LOW confirmation: 300 s / 5 min continuously CLOSED
 - WAIT_HIGH fallback: 1800 s / 30 min
 - bounded Zigbee reconnect wait: 10 s
 
-The firmware:
+The adaptive timer is used only for healthy `NORMAL` operation. It does not modify `LOW_PENDING` or `WAIT_HIGH`.
 
-- sleeps between useful events
-- powers the DS18B20 only for a measurement
-- places the DS18B20 data pin in high-impedance state before sleep
-- wakes on the LOW float while in `NORMAL`
-- during `LOW_PENDING`, watches for LOW to reopen and immediately cancels the confirmation if it does
-- validates LOW only after the full uninterrupted 5-minute timer window
-- ignores LOW transitions while waiting for the HIGH float
-- wakes on HIGH opening while in `WAIT_HIGH`
-- arms MAX17048 INT/ALRT on GPIO4 where applicable
-- performs periodic temperature/float refreshes rather than staying continuously awake
+## Hardware validation of adaptive timing
+
+The adaptive profile has been tested on the real prototype at 24.50 C:
+
+- production selected 3600 s / 1 h in `NORMAL`
+- LOW closure still woke the XIAO immediately while the 1-hour timer was armed
+- `LOW_PENDING` still used the fixed 300 s uninterrupted confirmation window
+- confirmed LOW entered `WAIT_HIGH`
+- the 1800 s WAIT_HIGH fallback woke and reported temperature without clearing the pending state
+- HIGH opening woke immediately and returned to `NORMAL`
+- the adaptive 3600 s interval was restored after returning to `NORMAL`
+
+This validates the main low-power design principle: periodic reporting can be slowed substantially without degrading the event-driven water-level response.
 
 ## Anti-wave wake strategy
 
@@ -67,6 +87,21 @@ Two pre-sleep races are also handled:
 
 The ESP32-C6 EXT1 wake implementation uses state-aware per-pin wake levels so a contact that remains in its current state does not create a wake/sleep loop.
 
+## Zigbee sleepy-device timeout
+
+The longest planned periodic sleep is now 6 hours, so the production firmware no longer relies on the shorter default child-aging timeout.
+
+It configures:
+
+```cpp
+zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout =
+    ESP_ZB_ED_AGING_TIMEOUT_2048MIN;
+```
+
+That corresponds to about 34 hours, leaving substantial margin over a 6-hour sleep and over isolated failed reconnect/report cycles.
+
+The normal Zigbee keep-alive configuration remains 10 seconds while the stack is active.
+
 ## Zigbee behavior and its energy impact
 
 The current Arduino-ESP32 / ZBOSS stack crashes if the firmware mutates certain Zigbee attributes at runtime and lets automatic reporting process them.
@@ -83,6 +118,8 @@ The validated low-power workaround is therefore:
 8. return to deep sleep
 
 During isolation, explicit `BatteryPercentageRemaining` reporting reproducibly asserted in the current ZBOSS version. `ZigbeeTempSensor::setPowerSource(...)` also caused a crash in this firmware configuration. MAX17048 voltage/SOC monitoring therefore remains local to the firmware/serial diagnostics for now.
+
+Because Zigbee reconnect/report cycles are much more expensive than deep sleep, the adaptive schedule should reduce average consumption substantially versus the previous fixed 30-minute periodic refresh. Final autonomy must still be based on measured current rather than on wake-count reduction alone.
 
 ## DS18B20 optimization
 
@@ -134,7 +171,7 @@ No final autonomy figure should be published until the assembled device is measu
 Measure current and duration for at least:
 
 1. deep-sleep state
-2. periodic 30-minute wake and report
+2. a periodic adaptive `NORMAL` wake and report
 3. DS18B20 conversion
 4. normal Zigbee reconnect/report cycle
 5. LOW event wake followed by `LOW_PENDING`
@@ -145,6 +182,8 @@ Measure current and duration for at least:
 10. MAX17048 alert wake
 11. failed Zigbee reconnect attempt
 12. battery-only and USB-charging cases separately
+
+For autonomy modelling, measure several representative adaptive intervals rather than assuming the old fixed 48 Zigbee refreshes/day. At 5-12 C, the 6-hour profile requests only four periodic `NORMAL` refreshes/day; at 24-28 C, it requests 24/day; at >=28 C or <3 C, it returns to 48/day.
 
 Also remove avoidable hardware loads, especially any permanently-on LED on the MAX17048 breakout, before final sleep-current measurement.
 
