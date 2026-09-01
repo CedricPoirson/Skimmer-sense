@@ -85,15 +85,38 @@ WAIT_HIGH
      -> NORMAL
 ```
 
-Production timing is currently:
+Production timing is now split between an adaptive periodic `NORMAL` refresh and fixed safety/state-machine timers.
 
-- normal periodic refresh: 30 min
+### Adaptive periodic refresh
+
+| Water temperature | Periodic `NORMAL` wake |
+|---|---:|
+| >= 28 C | 30 min |
+| 24 to < 28 C | 1 h |
+| 18 to < 24 C | 2 h |
+| 12 to < 18 C | 4 h |
+| 5 to < 12 C | 6 h |
+| 3 to < 5 C | 2 h |
+| < 3 C | 30 min |
+
+If the temperature measurement is invalid, firmware falls back to a 30-minute `NORMAL` timer.
+
+Fixed timings remain:
+
 - LOW confirmation: 5 min continuously CLOSED
 - WAIT_HIGH fallback: 30 min
+
+The adaptive periodic timer does **not** delay LOW or HIGH events. Float transitions are separate GPIO wake sources. This has been validated on the real prototype: with water at 24.50 C, `NORMAL` selected a 1-hour timer, LOW still woke immediately, the 5-minute confirmation worked unchanged, WAIT_HIGH used its 30-minute fallback, and HIGH opening woke immediately and returned to the 1-hour `NORMAL` interval.
 
 The WAIT_HIGH fallback is deliberately long because a confirmed low-water request may remain pending for hours until the permitted overnight refill window. HIGH opening is still event-driven and wakes the sensor immediately, so the 30-minute fallback does not delay refill completion.
 
 This means Home Assistant receives the confirmed `ON/ON` state only after the sensor-side 5-minute continuous confirmation has completed.
+
+### Sleepy-device availability note
+
+The longest periodic `NORMAL` sleep is now 6 hours. The firmware extends the Zigbee End Device aging timeout to `ESP_ZB_ED_AGING_TIMEOUT_2048MIN` (about 34 hours) so the device can remain a legitimate sleepy child across multi-hour sleeps.
+
+Zigbee2MQTT/Home Assistant availability configuration should not be tuned so aggressively that a planned 4-hour or 6-hour sleep is misinterpreted as a fault. Long-duration field validation of availability behavior is still part of the v0.9 acceptance work.
 
 ### Avoid accidental double confirmation
 
@@ -241,10 +264,13 @@ Before opening the real water supply:
 2. test all four float-state combinations with the manual water shutoff closed
 3. verify the firmware-side 5-minute continuous anti-wave confirmation
 4. verify that reopening LOW during those 5 minutes cancels the request immediately
-5. decide whether the additional Home Assistant low-level delay should remain at 5 minutes for the first real tests
-6. verify the Home Assistant maximum-open timeout
-7. verify the independent IPX800 timeout
-8. verify the valve is normally closed when 24 VAC is absent
-9. perform the first real refill cycle under supervision
-10. measure the real refill duration between the two float thresholds
-11. use that duration to confirm or tighten the final timeout values
+5. verify that a long adaptive `NORMAL` timer does not delay LOW GPIO wake
+6. verify that HIGH GPIO wake remains immediate in WAIT_HIGH
+7. check Zigbee2MQTT/Home Assistant availability behavior across the longest planned sleep interval
+8. decide whether the additional Home Assistant low-level delay should remain at 5 minutes for the first real tests
+9. verify the Home Assistant maximum-open timeout
+10. verify the independent IPX800 timeout
+11. verify the valve is normally closed when 24 VAC is absent
+12. perform the first real refill cycle under supervision
+13. measure the real refill duration between the two float thresholds
+14. use that duration to confirm or tighten the final timeout values
