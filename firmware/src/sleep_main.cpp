@@ -30,6 +30,10 @@
 #define SKIMMERSENSE_ZIGBEE_WAIT_MS 10000UL
 #endif
 
+#ifndef SKIMMERSENSE_SERIAL_STARTUP_MS
+#define SKIMMERSENSE_SERIAL_STARTUP_MS 1200UL
+#endif
+
 #ifndef SKIMMERSENSE_ZIGBEE_IDLE_MS
 #define SKIMMERSENSE_ZIGBEE_IDLE_MS 8000UL
 #endif
@@ -664,7 +668,7 @@ CyclePlan makePlan(LevelState state,
 
 void setup() {
   Serial.begin(115200);
-  delay(1200);
+  delay(SKIMMERSENSE_SERIAL_STARTUP_MS);
 
   const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   const uint64_t extMask = currentExt1Mask();
