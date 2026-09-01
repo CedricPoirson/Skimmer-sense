@@ -24,7 +24,9 @@ Periodic refresh is selected from the measured water temperature:
 | 3 to < 5 C | 7200 s / 2 h |
 | < 3 C | 1800 s / 30 min |
 
-If the DS18B20 reading is invalid, the production build falls back to `SKIMMERSENSE_NORMAL_TIMER_SECONDS`, currently 1800 s / 30 min.
+If a fresh DS18B20 reading is invalid and no retained valid interval exists, the production build falls back to `SKIMMERSENSE_NORMAL_TIMER_SECONDS`, currently 1800 s / 30 min.
+
+For short event-only wakes that do not need to publish temperature, the firmware now skips the DS18B20 conversion and reuses the last valid adaptive `NORMAL` interval retained in RTC memory. This avoids forcing the schedule back to the conservative 30-minute fallback merely because temperature was intentionally not read on that wake.
 
 The U-shaped profile intentionally spends the least energy in moderate water temperatures while increasing observation frequency again for very warm water and close to freezing.
 
@@ -47,6 +49,16 @@ The adaptive profile has been tested on the real prototype at 24.50 C:
 - the 1800 s WAIT_HIGH fallback woke and reported temperature without clearing the pending state
 - HIGH opening woke immediately and returned to `NORMAL`
 - the adaptive 3600 s interval was restored after returning to `NORMAL`
+
+A later hardware run at 23.75 C selected 7200 s / 2 h, and an event-only float wake was observed with:
+
+```text
+Water temperature: skipped for this wake
+Adaptive NORMAL timer: 7200 s (cached from 23.75 C)
+Zigbee cycle intentionally skipped for this state transition.
+```
+
+This validates the RTC-retained adaptive interval and the selective DS18B20-read path on real hardware.
 
 This validates the main low-power design principle: periodic reporting can be slowed substantially without degrading the event-driven water-level response.
 
@@ -108,22 +120,23 @@ The current Arduino-ESP32 / ZBOSS stack crashes if the firmware mutates certain 
 
 The validated low-power workaround is therefore:
 
-1. wake and read sensors
-2. preload temperature and float attributes before `Zigbee.begin()`
-3. reconnect with a bounded wait
-4. send explicit zero-initialized reports for temperature and/or float states
-5. keep Zigbee Power Configuration setup disabled
-6. skip explicit battery reporting
-7. wait briefly for delivery
-8. return to deep sleep
+1. wake and read the sensor data needed for the current state transition
+2. skip the DS18B20 conversion on event-only wakes when no fresh temperature report is required
+3. preload temperature and float attributes before `Zigbee.begin()` when a Zigbee cycle is needed
+4. reconnect with a bounded wait
+5. send explicit zero-initialized reports for temperature and/or float states
+6. keep Zigbee Power Configuration setup disabled
+7. skip explicit battery reporting
+8. wait briefly for delivery
+9. return to deep sleep
 
 During isolation, explicit `BatteryPercentageRemaining` reporting reproducibly asserted in the current ZBOSS version. `ZigbeeTempSensor::setPowerSource(...)` also caused a crash in this firmware configuration. MAX17048 voltage/SOC monitoring therefore remains local to the firmware/serial diagnostics for now.
 
-Because Zigbee reconnect/report cycles are much more expensive than deep sleep, the adaptive schedule should reduce average consumption substantially versus the previous fixed 30-minute periodic refresh. Final autonomy must still be based on measured current rather than on wake-count reduction alone.
+Because Zigbee reconnect/report cycles are much more expensive than deep sleep, the adaptive schedule should reduce average consumption substantially versus the previous fixed 30-minute periodic refresh. Selective DS18B20 reads also remove the roughly 10-bit conversion/startup cost from short event-only wakes. Final autonomy must still be based on measured current rather than on wake-count reduction alone.
 
 ## DS18B20 optimization
 
-Current sequence:
+When a fresh temperature is required, the sequence is:
 
 1. D2 HIGH powers the DS18B20
 2. wait briefly for sensor startup
@@ -133,6 +146,12 @@ Current sequence:
 6. drive D2 LOW before sleep
 
 10-bit resolution is sufficient for pool-water monitoring and reduces awake time compared with 12-bit conversion.
+
+The production firmware no longer performs this sequence on every wake. It first evaluates the float state and wake reason, then powers the DS18B20 only when the resulting cycle plan requests a fresh temperature report. Event-only transitions such as a short LOW-level wake can therefore return to sleep without powering or converting the probe.
+
+The last valid temperature-derived `NORMAL` interval and its source temperature are retained in RTC memory across deep sleep. If an event-only wake returns to `NORMAL` without a fresh DS18B20 reading, that cached interval is reused. The cache is reset on a real cold boot/reset so stale data is not carried across a full restart.
+
+Hardware evidence collected on the prototype includes a 23.75 C measurement selecting 7200 s, followed by a later event wake that logged `Water temperature: skipped for this wake` while retaining `Adaptive NORMAL timer: 7200 s (cached from 23.75 C)`.
 
 ## MAX17048 considerations
 
@@ -174,8 +193,8 @@ Measure current and duration for at least:
 2. a periodic adaptive `NORMAL` wake and report
 3. DS18B20 conversion
 4. normal Zigbee reconnect/report cycle
-5. LOW event wake followed by `LOW_PENDING`
-6. LOW reopen wake during the 5-minute confirmation window
+5. LOW event wake followed by `LOW_PENDING` with DS18B20 intentionally skipped
+6. LOW reopen wake during the 5-minute confirmation window with the cached adaptive interval reused
 7. confirmed LOW report and `WAIT_HIGH` entry
 8. 30-minute WAIT_HIGH fallback wake
 9. HIGH event wake and final report
