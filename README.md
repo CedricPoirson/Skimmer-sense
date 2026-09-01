@@ -2,7 +2,7 @@
 
 Battery-powered Zigbee pool-skimmer monitor for Home Assistant, built around a Seeed Studio XIAO ESP32-C6.
 
-SkimmerSense measures pool-water temperature, monitors two mechanical water-level floats and reads battery telemetry through a MAX17048 fuel gauge. Home Assistant uses the two level inputs to supervise a separate refill circuit with multiple safety layers.
+SkimmerSense measures pool-water temperature, monitors two mechanical water-level floats and reads battery telemetry locally through a MAX17048 fuel gauge. Home Assistant uses the two level inputs to supervise a separate refill circuit with multiple safety layers.
 
 ## Current status
 
@@ -20,6 +20,8 @@ Validated on the current XIAO ESP32-C6 prototype:
 - deep sleep with timer wake
 - GPIO wake from the float switches
 - RTC-retained anti-wave state machine
+- continuous LOW confirmation that is cancelled immediately if LOW reopens
+- impossible `LOW=CLOSED / HIGH=OPEN` fault handling while in `NORMAL`
 - repeated temperature/float Zigbee report cycles without ZBOSS assertion or Guru Meditation
 - Home Assistant receives temperature and both float states
 - Home Assistant level-state synthesis and dry-contact IPX800 V4 refill-control logic
@@ -28,8 +30,10 @@ Validated on the current XIAO ESP32-C6 prototype:
 Production-candidate timing profile:
 
 - normal periodic refresh: **30 min**
-- LOW-level confirmation: **5 min**
-- WAIT_HIGH fallback check while filling: **2 min**
+- LOW-level confirmation: **5 min continuously CLOSED**
+- WAIT_HIGH fallback check: **30 min**
+
+GPIO events remain immediate; the 30-minute timers do not delay LOW detection or HIGH-level completion.
 
 Still to validate before merging v0.9 to `main`:
 
@@ -100,11 +104,11 @@ The MAX17048 `QSTRT` pin is not used by the firmware and must not be confused wi
 
 ## Zigbee endpoints
 
-Current firmware exposes:
+Current validated firmware exposes:
 
 | Endpoint | Function |
 |---:|---|
-| 10 | Water temperature + Power Configuration cluster |
+| 10 | Water temperature |
 | 11 | Low-level float raw contact state |
 | 12 | High-level float raw contact state |
 
@@ -112,6 +116,8 @@ Manufacturer/model strings:
 
 - Manufacturer: `SkimmerSense`
 - Model: `SkimmerSense-v1`
+
+MAX17048 voltage/SOC remain available in serial diagnostics, but Zigbee Power Configuration setup/reporting is disabled on this stack because it triggers a reproducible ZBOSS failure.
 
 The float endpoints intentionally expose the physical contact state. Semantic states such as low water, normal level, refill and float fault are derived in Home Assistant.
 
@@ -135,7 +141,7 @@ This gives natural mechanical hysteresis between refill start and stop.
 
 ## Anti-wave deep-sleep state machine
 
-The production candidate avoids repeated wake-ups caused by waves or bathers.
+The production candidate rejects waves and bather motion by requiring a continuous LOW condition.
 
 ```text
 NORMAL
@@ -143,11 +149,12 @@ NORMAL
       |
       v
 LOW_PENDING
-  timer-only confirmation: 5 min
+  start 5-minute confirmation
+  watch LOW for reopening
       |
-      +-- LOW reopened -> reject as transient wave / motion -> NORMAL
+      +-- LOW reopens before 5 min -> immediate GPIO wake -> reject transient -> NORMAL
       |
-      +-- LOW still closed + HIGH closed
+      +-- LOW remains CLOSED continuously for 5 min + HIGH CLOSED
               |
               v
           WAIT_HIGH
@@ -155,21 +162,23 @@ LOW_PENDING
           ignore LOW transitions
           watch HIGH
               |
-              +-- HIGH opens -> publish LOW first, then HIGH -> NORMAL
+              +-- HIGH opens -> immediate GPIO wake -> publish final states -> NORMAL
 ```
 
 Important behavior validated on hardware:
 
-- in `NORMAL`, LOW can wake the XIAO immediately
-- during `LOW_PENDING`, float GPIO wake is intentionally disabled while the 5-minute confirmation runs
+- in `NORMAL`, LOW wakes the XIAO immediately when it closes
+- during `LOW_PENDING`, LOW is armed for the opposite transition; reopening cancels confirmation immediately
+- only a timer wake after a full uninterrupted confirmation window can validate LOW
 - in `WAIT_HIGH`, LOW transitions are intentionally ignored
 - HIGH opening wakes the XIAO immediately
-- a 2-minute timer remains as a fallback while waiting for HIGH
+- the WAIT_HIGH timer is **30 min** only as a fallback/periodic check while a refill request may remain pending for hours
 - if HIGH changes while Zigbee is still awake just before sleep, the firmware forces a 1-second resample rather than waiting for the fallback timer
+- in `NORMAL`, `LOW=CLOSED / HIGH=OPEN` is published as an impossible/fault state and does not enter `LOW_PENDING`
 
 ## Zigbee reporting workaround
 
-The current Arduino-ESP32 / ZBOSS stack has two reporting problems isolated during v0.9 development.
+The current Arduino-ESP32 / ZBOSS stack has reporting problems isolated during v0.9 development.
 
 ### Runtime attribute mutation
 
@@ -178,34 +187,35 @@ Calling Arduino Zigbee setters after the stack is running can enter the ZBOSS au
 The production candidate therefore:
 
 1. wakes and reads the real sensors first
-2. preloads temperature, float and battery attributes **before** `Zigbee.begin()`
+2. preloads the temperature and float values **before** `Zigbee.begin()`
 3. reconnects Zigbee
 4. sends explicit, zero-initialized reports for temperature and the float states only
 5. avoids runtime Zigbee attribute mutation
 6. returns to deep sleep
 
-### Battery report limitation
+### Battery reporting limitation
 
-Explicit `Power Configuration / Battery Percentage Remaining` reports reproducibly assert in `esp_zigbee_zcl_command.c:263`, including when addressed directly to coordinator `0x0000` endpoint 1.
+During isolation tests, explicit `Power Configuration / Battery Percentage Remaining` reports reproducibly asserted in `esp_zigbee_zcl_command.c:263`, including when addressed directly to coordinator `0x0000` endpoint 1. `ZigbeeTempSensor::setPowerSource(...)` also caused a ZBOSS crash in this firmware configuration.
 
 Current safe behavior:
 
 - MAX17048 voltage and raw SOC are read normally
 - raw SOC remains visible in serial diagnostics
-- Zigbee-facing SOC is clamped to 0-100%
-- the Power Configuration cluster is preloaded before Zigbee starts
-- **explicit battery reporting is disabled**
+- SOC is clamped locally to 0-100% for diagnostics/future use
+- Zigbee Power Configuration setup via `setPowerSource()` is disabled
+- explicit battery reporting is disabled
 
-This is an intentional workaround, not a missing call. Battery refresh behavior through coordinator reads/re-interview remains to be characterized, and the explicit battery-report path should stay disabled until a framework version is verified to fix the ZBOSS issue.
+This is an intentional workaround, not a missing call. Battery monitoring remains local through the MAX17048 until a framework version is verified to fix the ZBOSS issue.
 
 ## Refill safety concept
 
 The Home Assistant strategy is deliberately conservative:
 
 - automatic refill is allowed only during the configured time window
-- LOW must be confirmed before a refill request is published
+- LOW must be continuously confirmed before a refill request is published
+- the request may remain pending for hours until the allowed overnight window
 - refill continues through the middle hysteresis state
-- HIGH ends the refill sequence
+- HIGH ends the refill sequence immediately through GPIO wake
 - impossible float state is treated as a fault
 - unavailable sensor data while filling closes the valve
 - Home Assistant enforces a maximum continuous valve-open duration
@@ -236,7 +246,7 @@ The production environment uses:
 ```text
 SKIMMERSENSE_NORMAL_TIMER_SECONDS     = 1800
 SKIMMERSENSE_LOW_CONFIRM_SECONDS      = 300
-SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS  = 120
+SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS  = 1800
 ```
 
 The shorter anti-wave environment remains available for bench testing.
@@ -252,11 +262,9 @@ Skimmer-sense/
 │   ├── platformio.ini
 │   └── src/
 │       ├── main.cpp
-│       ├── sleep_main.cpp
-│       ├── sleep_gpio_test.cpp
-│       ├── sleep_zigbee_preload_report.cpp
-│       ├── sleep_zigbee_snapshot_reports.cpp
-│       └── additional Zigbee diagnostic stages
+│       └── sleep_main.cpp
+├── firmware/tests/
+│   └── archived diagnostic stages
 ├── hardware/
 │   ├── bom.md
 │   └── wiring.md
@@ -281,9 +289,11 @@ Skimmer-sense/
 - [x] timer wake from deep sleep
 - [x] GPIO wake on float transitions
 - [x] anti-wave `NORMAL / LOW_PENDING / WAIT_HIGH` state machine
-- [x] production timing profile: 30 min / 5 min / 2 min
+- [x] continuous 5-minute LOW confirmation with immediate cancellation on reopen
+- [x] impossible float-state handling in `NORMAL`
+- [x] production timing profile: 30 min / 5 min / 30 min
 - [x] isolate and document the ZBOSS runtime-reporting crash
-- [x] isolate and document the explicit battery-report crash
+- [x] isolate and document the Zigbee Power Configuration / battery-report crash
 - [ ] protected 18650 battery-only validation
 - [ ] GPIO wake on a real MAX17048 low-battery alert
 - [ ] real deep-sleep current measurements
