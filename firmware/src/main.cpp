@@ -7,27 +7,37 @@
 #error "SkimmerSense must be built in Zigbee End Device mode"
 #endif
 
+#ifndef SKIMMERSENSE_DEBUG
+#define SKIMMERSENSE_DEBUG 1
+#endif
+
+#ifndef SKIMMERSENSE_TEMP_INTERVAL_MS
+#define SKIMMERSENSE_TEMP_INTERVAL_MS (60UL * 1000UL)
+#endif
+
+#ifndef SKIMMERSENSE_MAX17048_INTERVAL_MS
+#define SKIMMERSENSE_MAX17048_INTERVAL_MS (30UL * 1000UL)
+#endif
+
+#ifndef SKIMMERSENSE_ZIGBEE_WAIT_MS
+#define SKIMMERSENSE_ZIGBEE_WAIT_MS (60UL * 1000UL)
+#endif
+
 #include "Zigbee.h"
 
-// SkimmerSense pinout for Seeed Studio XIAO ESP32-C6
-// D0 -> low-level float switch
-// D1 -> high-level float switch
-// D2 -> switched power for DS18B20
-// D3 -> DS18B20 1-Wire data
-// D4 -> MAX17048 SDA
-// D5 -> MAX17048 SCL
-// MTMS / GPIO4 -> MAX17048 INT/ALRT (active LOW)
+static constexpr char FIRMWARE_VERSION[] = "0.9-battery-zigbee-safe";
 
+// SkimmerSense pinout for Seeed Studio XIAO ESP32-C6.
 static constexpr uint8_t PIN_FLOAT_LOW = D0;
 static constexpr uint8_t PIN_FLOAT_HIGH = D1;
 static constexpr uint8_t PIN_DS18B20_POWER = D2;
 static constexpr uint8_t PIN_DS18B20_DATA = D3;
 static constexpr uint8_t PIN_I2C_SDA = D4;
 static constexpr uint8_t PIN_I2C_SCL = D5;
-static constexpr uint8_t PIN_MAX17048_INT = 4;  // GPIO4 / MTMS, NOT D4
+static constexpr uint8_t PIN_MAX17048_INT = 4;  // GPIO4 / MTMS -> MAX17048 ALRT/INT
 static constexpr uint8_t PIN_FACTORY_RESET = BOOT_PIN;
 
-// MAX17048
+// MAX17048 registers.
 static constexpr uint8_t MAX17048_I2C_ADDRESS = 0x36;
 static constexpr uint8_t MAX17048_REG_VCELL = 0x02;
 static constexpr uint8_t MAX17048_REG_SOC = 0x04;
@@ -36,7 +46,7 @@ static constexpr uint8_t MAX17048_REG_CONFIG = 0x0C;
 static constexpr uint8_t MAX17048_REG_CRATE = 0x16;
 static constexpr uint8_t MAX17048_REG_STATUS = 0x1A;
 
-// STATUS register bits (first byte at address 0x1A).
+// STATUS first-byte bits.
 static constexpr uint8_t MAX17048_STATUS_SC = 0x20;
 static constexpr uint8_t MAX17048_STATUS_HD = 0x10;
 static constexpr uint8_t MAX17048_STATUS_VR = 0x08;
@@ -44,33 +54,57 @@ static constexpr uint8_t MAX17048_STATUS_VL = 0x04;
 static constexpr uint8_t MAX17048_STATUS_VH = 0x02;
 static constexpr uint8_t MAX17048_STATUS_RI = 0x01;
 
-// CONFIG low byte: bit 5 is ALRT, bits 4:0 are ATHD.
+// CONFIG low byte: bit 5 = ALRT, bits 4:0 = ATHD.
 static constexpr uint16_t MAX17048_CONFIG_ALRT = 0x0020;
 
-// Zigbee endpoints
+// Zigbee endpoints. Do not change: Home Assistant currently relies on them.
 static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
 static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
 static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
 
-// Validation timings. Production battery firmware will use deep sleep.
-static constexpr uint32_t TEMP_INTERVAL_MS = 60UL * 1000UL;
+// Bench-validation timings. Deep sleep is deliberately not enabled yet.
+static constexpr uint32_t TEMP_INTERVAL_MS = SKIMMERSENSE_TEMP_INTERVAL_MS;
 static constexpr uint32_t FLOAT_DEBOUNCE_MS = 50;
-static constexpr uint32_t MAX17048_CHECK_INTERVAL_MS = 30UL * 1000UL;
+static constexpr uint32_t BATTERY_INTERVAL_MS = SKIMMERSENSE_MAX17048_INTERVAL_MS;
+static constexpr uint32_t ZIGBEE_CONNECT_WAIT_MS = SKIMMERSENSE_ZIGBEE_WAIT_MS;
+
+struct Max17048Telemetry {
+  bool present = false;
+  bool versionValid = false;
+  bool statusValid = false;
+  bool configValid = false;
+  bool telemetryValid = false;
+  uint16_t version = 0;
+  uint16_t rawStatus = 0;
+  uint16_t config = 0;
+  float voltage = 0.0f;
+  float soc = 0.0f;
+  float rate = 0.0f;
+};
 
 OneWire oneWire(PIN_DS18B20_DATA);
 DallasTemperature temperatureSensors(&oneWire);
 
+// Power Configuration is attached to endpoint 10. Keeping battery information
+// on the temperature endpoint preserves the existing 10/11/12 endpoint layout.
 ZigbeeTempSensor zbTemperature(ZB_EP_TEMPERATURE);
 ZigbeeBinary zbLowLevel(ZB_EP_LOW_LEVEL);
 ZigbeeBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
 
-bool lastLowRaw = HIGH;
-bool lastHighRaw = HIGH;
+bool stableLowRaw = HIGH;
+bool stableHighRaw = HIGH;
+bool candidateLowRaw = HIGH;
+bool candidateHighRaw = HIGH;
 bool lastMax17048Int = HIGH;
-uint32_t lastLowChangeMs = 0;
-uint32_t lastHighChangeMs = 0;
+bool zigbeeWasConnected = false;
+
+uint8_t lastPublishedBatteryPercentage = 0xFF;
+uint8_t lastPublishedBatteryVoltage = 0xFF;
+
+uint32_t lowCandidateSinceMs = 0;
+uint32_t highCandidateSinceMs = 0;
 uint32_t lastTemperatureMs = 0;
-uint32_t lastMax17048CheckMs = 0;
+uint32_t lastBatteryMs = 0;
 
 const char *contactState(bool rawState) {
   return rawState == LOW ? "CLOSED" : "OPEN";
@@ -109,6 +143,62 @@ bool writeMax17048Register16(uint8_t reg, uint16_t value) {
   return Wire.endTransmission() == 0;
 }
 
+bool readMax17048Telemetry(Max17048Telemetry &t) {
+  t = Max17048Telemetry{};
+
+  if (!i2cDevicePresent(MAX17048_I2C_ADDRESS)) {
+    return false;
+  }
+  t.present = true;
+
+  if (!readMax17048Register16(MAX17048_REG_VERSION, t.version)) {
+    return false;
+  }
+
+  t.versionValid = (t.version & 0xFFF0) == 0x0010;
+  t.statusValid = readMax17048Register16(MAX17048_REG_STATUS, t.rawStatus);
+  t.configValid = readMax17048Register16(MAX17048_REG_CONFIG, t.config);
+
+  uint16_t rawVcell = 0;
+  uint16_t rawSoc = 0;
+  uint16_t rawCrate = 0;
+
+  if (!t.versionValid ||
+      !readMax17048Register16(MAX17048_REG_VCELL, rawVcell) ||
+      !readMax17048Register16(MAX17048_REG_SOC, rawSoc) ||
+      !readMax17048Register16(MAX17048_REG_CRATE, rawCrate)) {
+    return t.present;
+  }
+
+  t.voltage = static_cast<float>(rawVcell) * 78.125f / 1000000.0f;
+  t.soc = static_cast<float>(rawSoc) / 256.0f;
+  t.rate = static_cast<float>(static_cast<int16_t>(rawCrate)) * 0.208f;
+  t.telemetryValid = true;
+  return true;
+}
+
+uint8_t zigbeeBatteryPercentage(float soc) {
+  if (soc <= 0.0f) {
+    return 0;
+  }
+  if (soc >= 100.0f) {
+    return 100;
+  }
+  return static_cast<uint8_t>(soc + 0.5f);
+}
+
+uint8_t zigbeeBatteryVoltage(float voltage) {
+  // ZCL BatteryVoltage uses units of 100 mV: 4.05 V -> 41.
+  if (voltage <= 0.0f) {
+    return 0;
+  }
+  const float units = voltage * 10.0f;
+  if (units >= 254.0f) {
+    return 254;
+  }
+  return static_cast<uint8_t>(units + 0.5f);
+}
+
 void printMax17048Status(uint8_t status) {
   Serial.printf("MAX17048 STATUS=0x%02X |", status);
 
@@ -143,23 +233,52 @@ void printMax17048Status(uint8_t status) {
   Serial.println();
 }
 
-void printMax17048Config() {
-  uint16_t config = 0;
-  if (!readMax17048Register16(MAX17048_REG_CONFIG, config)) {
-    Serial.println("MAX17048 CONFIG: read failed");
+void reportMax17048() {
+  Max17048Telemetry t;
+
+  Serial.printf("MAX17048 INT: %s\n",
+                max17048IntState(digitalRead(PIN_MAX17048_INT)));
+
+  if (!readMax17048Telemetry(t) || !t.present) {
+    Serial.println("MAX17048: no response on I2C address 0x36");
     return;
   }
 
-  const uint8_t rcomp = static_cast<uint8_t>(config >> 8);
-  const uint8_t low = static_cast<uint8_t>(config & 0xFF);
-  const uint8_t athd = low & 0x1F;
+  Serial.printf("MAX17048: I2C ACK | VERSION=0x%04X\n", t.version);
+
+  if (t.statusValid) {
+    printMax17048Status(static_cast<uint8_t>(t.rawStatus >> 8));
+  } else {
+    Serial.println("MAX17048 STATUS: read failed");
+  }
+
+  if (t.configValid) {
+    const uint8_t rcomp = static_cast<uint8_t>(t.config >> 8);
+    const uint8_t configLow = static_cast<uint8_t>(t.config & 0xFF);
+    const uint8_t athd = configLow & 0x1F;
+    Serial.printf(
+        "MAX17048 CONFIG=0x%04X | RCOMP=0x%02X | ALRT=%s | ATHD(raw)=%u\n",
+        t.config,
+        rcomp,
+        (t.config & MAX17048_CONFIG_ALRT) ? "SET" : "clear",
+        athd);
+  } else {
+    Serial.println("MAX17048 CONFIG: read failed");
+  }
+
+  if (!t.versionValid) {
+    Serial.println("MAX17048: unexpected VERSION value");
+    return;
+  }
+
+  if (!t.telemetryValid) {
+    Serial.println("MAX17048: telemetry register read failed");
+    return;
+  }
 
   Serial.printf(
-      "MAX17048 CONFIG=0x%04X | RCOMP=0x%02X | ALRT=%s | ATHD(raw)=%u\n",
-      config,
-      rcomp,
-      (config & MAX17048_CONFIG_ALRT) ? "SET" : "clear",
-      athd);
+      "MAX17048 | voltage: %.3f V | SOC: %.1f %% | rate: %.2f %%/h\n",
+      t.voltage, t.soc, t.rate);
 }
 
 void acknowledgeMax17048Alert() {
@@ -174,88 +293,29 @@ void acknowledgeMax17048Alert() {
 
   const uint8_t status = static_cast<uint8_t>(rawStatus >> 8);
 
-  // RI is expected after a power-up/reset of the gauge.
   if (status & MAX17048_STATUS_RI) {
     const uint16_t clearedStatus =
         rawStatus & ~(static_cast<uint16_t>(MAX17048_STATUS_RI) << 8);
-
-    if (!writeMax17048Register16(MAX17048_REG_STATUS, clearedStatus)) {
+    if (writeMax17048Register16(MAX17048_REG_STATUS, clearedStatus)) {
+      Serial.println("MAX17048: STATUS.RI cleared");
+    } else {
       Serial.println("MAX17048: failed to clear STATUS.RI");
-      return;
     }
-    Serial.println("MAX17048: STATUS.RI cleared");
   }
 
   if (config & MAX17048_CONFIG_ALRT) {
     const uint16_t newConfig = config & ~MAX17048_CONFIG_ALRT;
-    Serial.printf("MAX17048: clearing CONFIG.ALRT: 0x%04X -> 0x%04X\n",
-                  config, newConfig);
-
-    if (!writeMax17048Register16(MAX17048_REG_CONFIG, newConfig)) {
+    if (writeMax17048Register16(MAX17048_REG_CONFIG, newConfig)) {
+      Serial.println("MAX17048: CONFIG.ALRT acknowledged");
+    } else {
       Serial.println("MAX17048: failed to clear CONFIG.ALRT");
-      return;
     }
-    Serial.println("MAX17048: CONFIG.ALRT acknowledged");
-  } else {
-    Serial.println("MAX17048: CONFIG.ALRT already clear");
   }
 
   delay(20);
   lastMax17048Int = digitalRead(PIN_MAX17048_INT);
   Serial.printf("MAX17048 INT after acknowledge: %s\n",
                 max17048IntState(lastMax17048Int));
-}
-
-void reportMax17048() {
-  Serial.printf("MAX17048 INT: %s\n",
-                max17048IntState(digitalRead(PIN_MAX17048_INT)));
-
-  if (!i2cDevicePresent(MAX17048_I2C_ADDRESS)) {
-    Serial.println("MAX17048: no response on I2C address 0x36");
-    return;
-  }
-
-  uint16_t version = 0;
-  if (!readMax17048Register16(MAX17048_REG_VERSION, version)) {
-    Serial.println("MAX17048: I2C ACK, but VERSION register read failed");
-    return;
-  }
-
-  Serial.printf("MAX17048: I2C ACK | VERSION=0x%04X\n", version);
-
-  uint16_t rawStatus = 0;
-  if (readMax17048Register16(MAX17048_REG_STATUS, rawStatus)) {
-    printMax17048Status(static_cast<uint8_t>(rawStatus >> 8));
-  } else {
-    Serial.println("MAX17048: STATUS register read failed");
-  }
-
-  printMax17048Config();
-
-  if ((version & 0xFFF0) != 0x0010) {
-    Serial.println("MAX17048: gauge not ready (battery probably not connected)");
-    return;
-  }
-
-  uint16_t rawVcell = 0;
-  uint16_t rawSoc = 0;
-  uint16_t rawCrate = 0;
-
-  if (!readMax17048Register16(MAX17048_REG_VCELL, rawVcell) ||
-      !readMax17048Register16(MAX17048_REG_SOC, rawSoc) ||
-      !readMax17048Register16(MAX17048_REG_CRATE, rawCrate)) {
-    Serial.println("MAX17048: telemetry register read failed");
-    return;
-  }
-
-  const float voltage = static_cast<float>(rawVcell) * 78.125f / 1000000.0f;
-  const float soc = static_cast<float>(rawSoc) / 256.0f;
-  const float chargeRate =
-      static_cast<float>(static_cast<int16_t>(rawCrate)) * 0.208f;
-
-  Serial.printf(
-      "MAX17048 | voltage: %.3f V | SOC: %.1f %% | rate: %.2f %%/h\n",
-      voltage, soc, chargeRate);
 }
 
 float readWaterTemperatureC() {
@@ -275,6 +335,7 @@ float readWaterTemperatureC() {
   temperatureSensors.requestTemperatures();
   const float temperatureC = temperatureSensors.getTempCByIndex(0);
 
+  // Prevent parasitic current through DATA during future sleep.
   pinMode(PIN_DS18B20_DATA, INPUT);
   digitalWrite(PIN_DS18B20_POWER, LOW);
 
@@ -331,11 +392,79 @@ void publishTemperature(float temperatureC) {
   }
 }
 
+bool updateBatteryAttributesFromMax17048(bool force = false) {
+  Max17048Telemetry t;
+  if (!readMax17048Telemetry(t) || !t.telemetryValid) {
+    if (SKIMMERSENSE_DEBUG) {
+      Serial.println("Zigbee battery: MAX17048 telemetry unavailable");
+    }
+    return false;
+  }
+
+  const uint8_t percentage = zigbeeBatteryPercentage(t.soc);
+  const uint8_t voltage = zigbeeBatteryVoltage(t.voltage);
+  const bool percentageChanged = percentage != lastPublishedBatteryPercentage;
+  const bool voltageChanged = voltage != lastPublishedBatteryVoltage;
+
+  if (force || percentageChanged) {
+    if (!zbTemperature.setBatteryPercentage(percentage)) {
+      Serial.println("Zigbee battery: failed to set percentage attribute");
+      return false;
+    }
+  }
+
+  if (force || voltageChanged) {
+    if (!zbTemperature.setBatteryVoltage(voltage)) {
+      Serial.println("Zigbee battery: failed to set voltage attribute");
+      return false;
+    }
+  }
+
+  // IMPORTANT: do not call reportBatteryPercentage() here. Arduino-ESP32
+  // 3.3.x / ESP-ZBOSS can assert in esp_zigbee_zcl_command.c when an explicit
+  // Power Configuration report is sent immediately after network connection.
+  // Keep the standard attributes updated locally; Zigbee2MQTT can discover,
+  // read, bind and configure the Power Configuration cluster during reconfigure.
+  lastPublishedBatteryPercentage = percentage;
+  lastPublishedBatteryVoltage = voltage;
+
+  if (SKIMMERSENSE_DEBUG || force) {
+    Serial.printf(
+        "Zigbee battery attributes: %u %% | %.3f V (ZCL voltage=%u x 100mV) | raw SOC %.1f %%\n",
+        percentage,
+        t.voltage,
+        voltage,
+        t.soc);
+  }
+
+  return true;
+}
+
 void configureZigbeeEndpoints() {
   zbTemperature.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   zbTemperature.setMinMaxValue(-10, 60);
   zbTemperature.setDefaultValue(20.0);
   zbTemperature.setTolerance(1);
+
+  // Add standard ZCL Power Configuration cluster 0x0001 on endpoint 10.
+  // It must be part of the endpoint cluster list before Zigbee.begin().
+  Max17048Telemetry initialBattery;
+  uint8_t initialPercentage = 100;
+  uint8_t initialVoltage = 40;  // 4.0 V fallback used only for bench discovery.
+  if (readMax17048Telemetry(initialBattery) && initialBattery.telemetryValid) {
+    initialPercentage = zigbeeBatteryPercentage(initialBattery.soc);
+    initialVoltage = zigbeeBatteryVoltage(initialBattery.voltage);
+  }
+
+  if (!zbTemperature.setPowerSource(
+          ZB_POWER_SOURCE_BATTERY, initialPercentage, initialVoltage)) {
+    Serial.println("Zigbee battery: failed to add Power Configuration cluster");
+  } else {
+    Serial.printf(
+        "Zigbee battery cluster ready: %u %% | %u x 100mV\n",
+        initialPercentage,
+        initialVoltage);
+  }
 
   zbLowLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   zbLowLevel.addBinaryInput();
@@ -352,6 +481,26 @@ void configureZigbeeEndpoints() {
   Zigbee.addEndpoint(&zbHighLevel);
 }
 
+void publishCurrentState() {
+  publishLowFloat(stableLowRaw, true);
+  publishHighFloat(stableHighRaw, true);
+  publishTemperature(readWaterTemperatureC());
+  updateBatteryAttributesFromMax17048(true);
+}
+
+void handleZigbeeConnectionChange() {
+  const bool connected = Zigbee.connected();
+
+  if (connected && !zigbeeWasConnected) {
+    Serial.println("Zigbee connected!");
+    publishCurrentState();
+  } else if (!connected && zigbeeWasConnected) {
+    Serial.println("Zigbee connection lost; waiting for stack recovery.");
+  }
+
+  zigbeeWasConnected = connected;
+}
+
 void startZigbee() {
   Serial.println();
   Serial.println("Starting Zigbee End Device...");
@@ -363,19 +512,21 @@ void startZigbee() {
     ESP.restart();
   }
 
+  zbTemperature.setReporting(1, 60, 1);
+
   Serial.print("Waiting for Zigbee network");
-  while (!Zigbee.connected()) {
+  const uint32_t startedAt = millis();
+  while (!Zigbee.connected() && millis() - startedAt < ZIGBEE_CONNECT_WAIT_MS) {
     Serial.print(".");
     delay(250);
   }
   Serial.println();
-  Serial.println("Zigbee connected!");
 
-  zbTemperature.setReporting(1, 60, 1);
+  if (!Zigbee.connected()) {
+    Serial.println("Zigbee network wait timed out; continuing without blocking.");
+  }
 
-  publishLowFloat(digitalRead(PIN_FLOAT_LOW), true);
-  publishHighFloat(digitalRead(PIN_FLOAT_HIGH), true);
-  publishTemperature(readWaterTemperatureC());
+  handleZigbeeConnectionChange();
 }
 
 void handleFactoryResetButton() {
@@ -397,6 +548,30 @@ void handleFactoryResetButton() {
   }
 }
 
+void serviceFloatDebounce(uint32_t now) {
+  const bool lowRaw = digitalRead(PIN_FLOAT_LOW);
+  if (lowRaw != candidateLowRaw) {
+    candidateLowRaw = lowRaw;
+    lowCandidateSinceMs = now;
+  } else if (candidateLowRaw != stableLowRaw &&
+             now - lowCandidateSinceMs >= FLOAT_DEBOUNCE_MS) {
+    stableLowRaw = candidateLowRaw;
+    Serial.printf("LOW-level float changed: %s\n", contactState(stableLowRaw));
+    publishLowFloat(stableLowRaw);
+  }
+
+  const bool highRaw = digitalRead(PIN_FLOAT_HIGH);
+  if (highRaw != candidateHighRaw) {
+    candidateHighRaw = highRaw;
+    highCandidateSinceMs = now;
+  } else if (candidateHighRaw != stableHighRaw &&
+             now - highCandidateSinceMs >= FLOAT_DEBOUNCE_MS) {
+    stableHighRaw = candidateHighRaw;
+    Serial.printf("HIGH-level float changed: %s\n", contactState(stableHighRaw));
+    publishHighFloat(stableHighRaw);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1200);
@@ -404,8 +579,9 @@ void setup() {
   pinMode(PIN_FACTORY_RESET, INPUT_PULLUP);
   pinMode(PIN_FLOAT_LOW, INPUT_PULLUP);
   pinMode(PIN_FLOAT_HIGH, INPUT_PULLUP);
-  // MAX17048 INT/ALRT is open-drain; breakout is expected to provide pull-up.
-  pinMode(PIN_MAX17048_INT, INPUT);
+
+  // MAX17048 ALRT/INT is open-drain. GPIO4 connects to actual ALRT, not QSTRT.
+  pinMode(PIN_MAX17048_INT, INPUT_PULLUP);
 
   pinMode(PIN_DS18B20_POWER, OUTPUT);
   digitalWrite(PIN_DS18B20_POWER, LOW);
@@ -414,70 +590,63 @@ void setup() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(100000);
 
-  lastLowRaw = digitalRead(PIN_FLOAT_LOW);
-  lastHighRaw = digitalRead(PIN_FLOAT_HIGH);
+  stableLowRaw = digitalRead(PIN_FLOAT_LOW);
+  stableHighRaw = digitalRead(PIN_FLOAT_HIGH);
+  candidateLowRaw = stableLowRaw;
+  candidateHighRaw = stableHighRaw;
   lastMax17048Int = digitalRead(PIN_MAX17048_INT);
+  lowCandidateSinceMs = millis();
+  highCandidateSinceMs = millis();
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" SkimmerSense v0.8 - MAX17048 CONFIG diag");
+  Serial.printf(" SkimmerSense v%s\n", FIRMWARE_VERSION);
   Serial.println(" XIAO ESP32-C6 / Zigbee End Device");
   Serial.println("========================================");
-  Serial.printf("Float LOW : %s\n", contactState(lastLowRaw));
-  Serial.printf("Float HIGH: %s\n", contactState(lastHighRaw));
+  Serial.printf("Float LOW : %s\n", contactState(stableLowRaw));
+  Serial.printf("Float HIGH: %s\n", contactState(stableHighRaw));
   Serial.printf("MAX17048 INT: %s\n", max17048IntState(lastMax17048Int));
 
-  // Startup attempt can be lost from the USB monitor; a second visible
-  // diagnostic is deliberately performed after Zigbee has connected.
-  reportMax17048();
-  acknowledgeMax17048Alert();
+  if (SKIMMERSENSE_DEBUG) {
+    reportMax17048();
+    acknowledgeMax17048Alert();
+  }
 
   configureZigbeeEndpoints();
   startZigbee();
 
   lastTemperatureMs = millis();
-  lastMax17048CheckMs = millis();
+  lastBatteryMs = millis();
 
   Serial.println();
   Serial.println("SkimmerSense is online.");
-  Serial.println("Temperature interval: 60 seconds (test mode).");
-  Serial.println("MAX17048 telemetry interval: 30 seconds.");
-  Serial.println("MAX17048 INT/STATUS/CONFIG diagnostic enabled.");
+  Serial.printf("Temperature interval: %lu seconds (bench mode).\n",
+                static_cast<unsigned long>(TEMP_INTERVAL_MS / 1000UL));
+  Serial.printf("Battery/MAX17048 interval: %lu seconds.\n",
+                static_cast<unsigned long>(BATTERY_INTERVAL_MS / 1000UL));
+  Serial.println("Zigbee Power Configuration cluster: enabled on endpoint 10.");
+  Serial.println("Explicit battery report: disabled during safe validation.");
+  Serial.println("Deep sleep: disabled until real-battery validation.");
   Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
 
-  // Make the decisive diagnostic visible even when the USB CDC monitor
-  // misses the first lines during reset/re-enumeration.
-  delay(2000);
-  Serial.println();
-  Serial.println("--- MAX17048 POST-ZIGBEE DIAGNOSTIC ---");
-  reportMax17048();
-  acknowledgeMax17048Alert();
-  printMax17048Config();
-  Serial.printf("GPIO4 / MAX17048 INT final: %s\n",
-                max17048IntState(digitalRead(PIN_MAX17048_INT)));
-  Serial.println("--- END MAX17048 DIAGNOSTIC ---");
+  if (SKIMMERSENSE_DEBUG) {
+    delay(1000);
+    Serial.println();
+    Serial.println("--- MAX17048 POST-ZIGBEE DIAGNOSTIC ---");
+    reportMax17048();
+    acknowledgeMax17048Alert();
+    Serial.printf("GPIO4 / MAX17048 INT final: %s\n",
+                  max17048IntState(digitalRead(PIN_MAX17048_INT)));
+    Serial.println("--- END MAX17048 DIAGNOSTIC ---");
+  }
 }
 
 void loop() {
   const uint32_t now = millis();
 
   handleFactoryResetButton();
-
-  const bool lowRaw = digitalRead(PIN_FLOAT_LOW);
-  if (lowRaw != lastLowRaw && now - lastLowChangeMs >= FLOAT_DEBOUNCE_MS) {
-    lastLowRaw = lowRaw;
-    lastLowChangeMs = now;
-    Serial.printf("LOW-level float changed: %s\n", contactState(lowRaw));
-    publishLowFloat(lowRaw);
-  }
-
-  const bool highRaw = digitalRead(PIN_FLOAT_HIGH);
-  if (highRaw != lastHighRaw && now - lastHighChangeMs >= FLOAT_DEBOUNCE_MS) {
-    lastHighRaw = highRaw;
-    lastHighChangeMs = now;
-    Serial.printf("HIGH-level float changed: %s\n", contactState(highRaw));
-    publishHighFloat(highRaw);
-  }
+  handleZigbeeConnectionChange();
+  serviceFloatDebounce(now);
 
   const bool max17048Int = digitalRead(PIN_MAX17048_INT);
   if (max17048Int != lastMax17048Int) {
@@ -491,9 +660,12 @@ void loop() {
     publishTemperature(readWaterTemperatureC());
   }
 
-  if (now - lastMax17048CheckMs >= MAX17048_CHECK_INTERVAL_MS) {
-    lastMax17048CheckMs = now;
-    reportMax17048();
+  if (now - lastBatteryMs >= BATTERY_INTERVAL_MS) {
+    lastBatteryMs = now;
+    updateBatteryAttributesFromMax17048(false);
+    if (SKIMMERSENSE_DEBUG) {
+      reportMax17048();
+    }
   }
 
   delay(10);

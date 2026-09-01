@@ -23,7 +23,6 @@
 *.dll
 *.so.*
 
-
 # Fortran module files
 *.mod
 *.smod
@@ -43,6 +42,16 @@
 build/
 Build/
 build-*/
+
+# PlatformIO / editor local files
+.pio/
+.vscode/
+firmware/.pio/
+firmware/.vscode/
+
+# macOS
+.DS_Store
+**/.DS_Store
 
 # CMake generated files
 CMakeFiles/
