@@ -10,7 +10,6 @@ The current installation exposes:
 - low float raw state
 - high float raw state
 - Zigbee link quality
-- a Power Configuration / battery value may also be exposed by Zigbee2MQTT from the preloaded endpoint attributes
 
 Current entity IDs include:
 
@@ -18,22 +17,23 @@ Current entity IDs include:
 sensor.0x10bda3fffe90a960_temperature
 binary_sensor.0x10bda3fffe90a960_low_level_11
 binary_sensor.0x10bda3fffe90a960_high_level_12
-sensor.0x10bda3fffe90a960_battery
 ```
 
 The hexadecimal prefix is device-specific. Do not copy these IDs blindly to another installation.
 
+A battery entity may still exist in Zigbee2MQTT/Home Assistant from earlier interviews or test firmware. Do not rely on it for current v0.9 operation: Zigbee Power Configuration setup/reporting is intentionally disabled on the validated production candidate.
+
 ### Battery reporting limitation
 
-The firmware preloads the standard Zigbee Power Configuration attributes before `Zigbee.begin()`, but **explicit battery percentage reporting is currently disabled**.
-
-On the current Arduino-ESP32 / ZBOSS stack, an explicit `BatteryPercentageRemaining` report reproducibly asserts in `esp_zigbee_zcl_command.c:263`, even when addressed directly to the coordinator.
+On the current Arduino-ESP32 / ZBOSS stack, an explicit `BatteryPercentageRemaining` report reproducibly asserts in `esp_zigbee_zcl_command.c:263`, even when addressed directly to the coordinator. `ZigbeeTempSensor::setPowerSource(...)` also caused a reproducible ZBOSS crash in this firmware configuration.
 
 Therefore:
 
 - temperature and float reporting are considered validated
-- battery percentage may appear from interview/preloaded attributes
-- reliable periodic battery refresh is **not yet considered validated**
+- MAX17048 voltage/SOC are still read locally by the firmware and shown in serial diagnostics
+- Zigbee Power Configuration setup is disabled
+- explicit Zigbee battery reporting is disabled
+- reliable battery telemetry in Home Assistant is **not yet considered validated**
 - do not remove/re-pair the Zigbee device just to work around this unless a future stack fix requires it
 
 ## Raw float semantics
@@ -56,31 +56,44 @@ This raw representation is intentional. Home Assistant derives the human-readabl
 
 ## Sensor-side anti-wave logic
 
-The v0.9 production-candidate firmware already performs level confirmation before publishing a refill request:
+The v0.9 production-candidate firmware already performs continuous level confirmation before publishing a refill request:
 
 ```text
 NORMAL
   LOW closes
      |
-     | 5 min timer-only confirmation
      v
 LOW_PENDING
-  LOW reopened -> reject wave / bather motion
-  LOW still closed + HIGH closed -> publish ON/ON
+  start 5-minute timer
+  watch LOW for reopening
      |
-     v
+     +-- LOW reopens before 5 min
+     |      -> immediate GPIO wake
+     |      -> reject wave / bather motion
+     |      -> NORMAL
+     |
+     +-- LOW remains CLOSED continuously for 5 min
+            + HIGH CLOSED
+            -> publish ON/ON
+            -> WAIT_HIGH
+
 WAIT_HIGH
   LOW transitions ignored
-  HIGH opens -> publish final states and return NORMAL
+  HIGH opens
+     -> immediate GPIO wake
+     -> publish final states
+     -> NORMAL
 ```
 
 Production timing is currently:
 
 - normal periodic refresh: 30 min
-- LOW confirmation: 5 min
-- WAIT_HIGH fallback: 2 min
+- LOW confirmation: 5 min continuously CLOSED
+- WAIT_HIGH fallback: 30 min
 
-This means Home Assistant receives the confirmed `ON/ON` state only after the sensor-side confirmation has completed.
+The WAIT_HIGH fallback is deliberately long because a confirmed low-water request may remain pending for hours until the permitted overnight refill window. HIGH opening is still event-driven and wakes the sensor immediately, so the 30-minute fallback does not delay refill completion.
+
+This means Home Assistant receives the confirmed `ON/ON` state only after the sensor-side 5-minute continuous confirmation has completed.
 
 ### Avoid accidental double confirmation
 
@@ -149,6 +162,8 @@ The sensor node never directly energizes the valve.
 
 The Home Assistant/IPX800 **logic and dry-contact relay behavior have been tested**, but the final real solenoid/water path has not yet completed commissioning.
 
+A confirmed low-water request does not imply that water starts immediately. Home Assistant may keep that request pending until the allowed overnight refill window.
+
 ## Refill state machine
 
 The intended behavior is:
@@ -157,6 +172,7 @@ The intended behavior is:
 LOW=ON, HIGH=ON
         |
         | confirmed low-water request
+        | wait for allowed overnight window if necessary
         v
      REFILL ON
         |
@@ -165,7 +181,7 @@ LOW=ON, HIGH=ON
         v
 LOW=OFF, HIGH=OFF
         |
-        | stable high-level completion
+        | high-level completion
         v
      REFILL OFF
 ```
@@ -179,7 +195,7 @@ The tested Home Assistant logic uses the following safeguards:
 - automatic refill only during the allowed overnight window
 - low-level state validation before opening the valve
 - continue filling through the middle hysteresis state
-- high-level state validation before normal completion
+- high-level completion closes the valve
 - impossible float state -> immediate valve close + alert
 - lost/unavailable float sensor during filling -> valve close
 - Home Assistant maximum continuous valve-open timeout
@@ -223,11 +239,12 @@ Before opening the real water supply:
 
 1. verify the production SkimmerSense profile is installed
 2. test all four float-state combinations with the manual water shutoff closed
-3. verify the firmware-side 5-minute anti-wave confirmation
-4. decide whether the additional Home Assistant low-level delay should remain at 5 minutes for the first real tests
-5. verify the Home Assistant maximum-open timeout
-6. verify the independent IPX800 timeout
-7. verify the valve is normally closed when 24 VAC is absent
-8. perform the first real refill cycle under supervision
-9. measure the real refill duration between the two float thresholds
-10. use that duration to confirm or tighten the final timeout values
+3. verify the firmware-side 5-minute continuous anti-wave confirmation
+4. verify that reopening LOW during those 5 minutes cancels the request immediately
+5. decide whether the additional Home Assistant low-level delay should remain at 5 minutes for the first real tests
+6. verify the Home Assistant maximum-open timeout
+7. verify the independent IPX800 timeout
+8. verify the valve is normally closed when 24 VAC is absent
+9. perform the first real refill cycle under supervision
+10. measure the real refill duration between the two float thresholds
+11. use that duration to confirm or tighten the final timeout values
