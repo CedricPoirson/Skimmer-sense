@@ -38,7 +38,7 @@ The current branch now contains the hardware-validated deep-sleep / anti-wave pr
 | 3 to < 5 C | 7200 s / 2 h |
 | < 3 C | 1800 s / 30 min |
 
-If the temperature reading is invalid, the firmware falls back to the conservative fixed `SKIMMERSENSE_NORMAL_TIMER_SECONDS` value, currently 1800 s / 30 min.
+If the temperature reading is invalid and there is no retained valid interval, the firmware falls back to the conservative fixed `SKIMMERSENSE_NORMAL_TIMER_SECONDS` value, currently 1800 s / 30 min.
 
 Fixed state-machine timings remain:
 
@@ -63,6 +63,16 @@ The production build was exercised end to end on the real prototype at 24.50 C:
 - after returning to `NORMAL`, the 3600 s adaptive interval was restored
 - temperature, LOW and HIGH reports continued to queue successfully without a ZBOSS crash
 
+### Selective DS18B20 wake optimization
+
+- DS18B20 measurement is no longer performed unconditionally on every wake
+- the firmware first evaluates the wake cause and float state, then powers/converts the DS18B20 only when the cycle plan requires a fresh temperature report
+- short event-only wakes can therefore skip the DS18B20 startup/conversion cost and skip Zigbee entirely when no report is needed
+- the last valid adaptive `NORMAL` interval and source temperature are retained in RTC memory across deep sleep
+- returning to `NORMAL` without a fresh temperature read reuses that cached interval instead of falling back to 30 minutes
+- the cache is cleared on a real cold boot/reset
+- hardware validation observed `Water temperature: skipped for this wake` together with `Adaptive NORMAL timer: 7200 s (cached from 23.75 C)`
+
 ### Zigbee sleepy-child aging timeout
 
 Because adaptive `NORMAL` sleep can reach 6 hours, production now explicitly configures:
@@ -80,7 +90,7 @@ A crash in the current Arduino-ESP32 / ZBOSS stack was isolated to automatic rep
 
 Validated workaround:
 
-- read the real sensor snapshot before `Zigbee.begin()`
+- read the real sensor data needed for the current cycle before `Zigbee.begin()`
 - preload temperature and float attributes before the Zigbee stack starts
 - avoid runtime Arduino Zigbee attribute mutation
 - send zero-initialized explicit reports for temperature and float states only
@@ -100,8 +110,8 @@ An explicit battery report reproducibly asserts in `esp_zigbee_zcl_command.c:263
 - MAX17048 I2C address `0x36` and VERSION `0x0012` validated
 - MAX17048 INT wiring corrected to GPIO4 / MTMS and confirmed HIGH when inactive
 - raw SOC is retained for diagnostics while locally clamped to 0-100% for future use
-- production and anti-wave PlatformIO environments compile after the adaptive timing change
-- GitHub Actions build passes for the current production-candidate branch
+- production and anti-wave PlatformIO environments compile after the adaptive timing and selective DS18B20 changes
+- GitHub Actions build passes for the production-candidate branch prior to the latest documentation-only updates
 
 ### Remaining before merge to main
 
@@ -109,7 +119,7 @@ An explicit battery report reproducibly asserts in `esp_zigbee_zcl_command.c:263
 - trigger and validate a real MAX17048 low-battery ALRT wake
 - measure final deep-sleep and wake-cycle current
 - cut/disable any unnecessary MAX17048 breakout LED before final autonomy measurement
-- quantify battery life with the adaptive wake profile
+- quantify battery life with the adaptive wake profile and selective DS18B20 reads
 - observe the production profile for several days, including 4-hour and 6-hour sleep intervals
 - verify Zigbee2MQTT/Home Assistant availability behavior across the longest sleeps
 - connect the real refill valve and run the first supervised water-fill cycle
