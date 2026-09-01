@@ -85,6 +85,13 @@ enum class LevelState : uint8_t {
 RTC_DATA_ATTR uint32_t rtcMagic = 0;
 RTC_DATA_ATTR uint8_t rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
 
+// Last valid adaptive NORMAL interval retained across deep sleep.
+// Short event-only wakes can therefore skip the DS18B20 conversion.
+RTC_DATA_ATTR uint64_t rtcNormalSleepSeconds =
+    SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+RTC_DATA_ATTR float rtcLastWaterTemperatureC = 20.0f;
+RTC_DATA_ATTR bool rtcNormalSleepValid = false;
+
 OneWire oneWire(PIN_DS18B20_DATA);
 DallasTemperature temperatureSensors(&oneWire);
 
@@ -151,24 +158,33 @@ const char *contactState(bool closed) {
 }
 
 
-uint64_t normalSleepSecondsForTemperature(const SensorSnapshot &snapshot) {
-#ifdef SKIMMERSENSE_PRODUCTION_BUILD
+uint64_t normalSleepSecondsForTemperature(
+    const SensorSnapshot &snapshot) {
+#ifndef SKIMMERSENSE_PRODUCTION_BUILD
+  return SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+#else
   if (!snapshot.temperatureValid) {
-    return SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+    return rtcNormalSleepValid
+             ? rtcNormalSleepSeconds
+             : SKIMMERSENSE_NORMAL_TIMER_SECONDS;
   }
 
   const float t = snapshot.waterTemperatureC;
+  uint64_t seconds;
 
-  if (t >= 28.0f) return 1800ULL;   // 30 min
-  if (t >= 24.0f) return 3600ULL;   // 1 h
-  if (t >= 18.0f) return 7200ULL;   // 2 h
-  if (t >= 12.0f) return 14400ULL;  // 4 h
-  if (t >= 5.0f)  return 21600ULL;  // 6 h
-  if (t >= 3.0f)  return 7200ULL;   // 2 h
+  if (t >= 28.0f)      seconds = 1800ULL;
+  else if (t >= 24.0f) seconds = 3600ULL;
+  else if (t >= 18.0f) seconds = 7200ULL;
+  else if (t >= 12.0f) seconds = 14400ULL;
+  else if (t >= 5.0f)  seconds = 21600ULL;
+  else if (t >= 3.0f)  seconds = 7200ULL;
+  else                 seconds = 1800ULL;
 
-  return 1800ULL;                    // < 3 C: 30 min
-#else
-  return SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+  rtcNormalSleepSeconds = seconds;
+  rtcLastWaterTemperatureC = t;
+  rtcNormalSleepValid = true;
+
+  return seconds;
 #endif
 }
 
@@ -264,7 +280,7 @@ float readWaterTemperatureC() {
   return value;
 }
 
-SensorSnapshot readSensorSnapshot() {
+SensorSnapshot readBaseSensorSnapshot() {
   SensorSnapshot snapshot;
 
   releaseRtcWakePins();
@@ -306,14 +322,21 @@ SensorSnapshot readSensorSnapshot() {
     snapshot.batteryVoltageZcl = static_cast<uint8_t>(voltage100mV);
   }
 
+  acknowledgeMax17048Alert();
+  return snapshot;
+}
+
+void readTemperatureIntoSnapshot(SensorSnapshot &snapshot) {
+  snapshot.temperatureValid = false;
+
   const float temperature = readWaterTemperatureC();
-  if (temperature != DEVICE_DISCONNECTED_C && temperature > -55.0f && temperature < 85.0f) {
+
+  if (temperature != DEVICE_DISCONNECTED_C &&
+      temperature > -55.0f &&
+      temperature < 85.0f) {
     snapshot.temperatureValid = true;
     snapshot.waterTemperatureC = temperature;
   }
-
-  acknowledgeMax17048Alert();
-  return snapshot;
 }
 
 bool configureZigbeeEndpoints(const SensorSnapshot &snapshot) {
@@ -439,6 +462,9 @@ LevelState loadState(esp_sleep_wakeup_cause_t cause) {
       rtcStateRaw > static_cast<uint8_t>(LevelState::WAIT_HIGH)) {
     rtcMagic = RTC_MAGIC;
     rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
+    rtcNormalSleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+    rtcLastWaterTemperatureC = 20.0f;
+    rtcNormalSleepValid = false;
     return LevelState::NORMAL;
   }
   return static_cast<LevelState>(rtcStateRaw);
@@ -654,26 +680,47 @@ void setup() {
   printWakeReason();
   Serial.printf("RTC state: %s\n", stateName(state));
 
-  const SensorSnapshot snapshot = readSensorSnapshot();
-  Serial.printf("Float LOW : %s\n", contactState(snapshot.lowClosed));
-  Serial.printf("Float HIGH: %s\n", contactState(snapshot.highClosed));
-  if (snapshot.temperatureValid) {
-    Serial.printf("Water temperature: %.2f C\n", snapshot.waterTemperatureC);
-  } else {
-    Serial.println("Water temperature: invalid");
+  SensorSnapshot snapshot = readBaseSensorSnapshot();
+
+  // First decide from floats and wake cause only.
+  // Power the DS18B20 only if this cycle actually needs a fresh
+  // temperature value/report.
+  CyclePlan plan = makePlan(state, snapshot, cause, extMask);
+  const bool temperatureReadRequested = plan.reportTemperature;
+
+  if (temperatureReadRequested) {
+    readTemperatureIntoSnapshot(snapshot);
+    plan = makePlan(state, snapshot, cause, extMask);
   }
+
+  Serial.printf("Float LOW : %s\n",
+                contactState(snapshot.lowClosed));
+  Serial.printf("Float HIGH: %s\n",
+                contactState(snapshot.highClosed));
+
+  if (temperatureReadRequested) {
+    if (snapshot.temperatureValid) {
+      Serial.printf("Water temperature: %.2f C\n",
+                    snapshot.waterTemperatureC);
+    } else {
+      Serial.println("Water temperature: invalid");
+    }
+  } else {
+    Serial.println("Water temperature: skipped for this wake");
+  }
+
   if (snapshot.batteryValid) {
-    Serial.printf("MAX17048: VERSION=0x%04X | %.3f V | raw SOC %.1f %% | Zigbee %u %% | INT was %s\n",
-                  snapshot.maxVersion,
-                  snapshot.batteryVoltage,
-                  snapshot.batterySocRaw,
-                  snapshot.batteryPercent,
-                  snapshot.maxIntLow ? "LOW" : "HIGH");
+    Serial.printf(
+        "MAX17048: VERSION=0x%04X | %.3f V | raw SOC %.1f %% | Zigbee %u %% | INT was %s\n",
+        snapshot.maxVersion,
+        snapshot.batteryVoltage,
+        snapshot.batterySocRaw,
+        snapshot.batteryPercent,
+        snapshot.maxIntLow ? "LOW" : "HIGH");
   } else {
     Serial.println("MAX17048: unavailable");
   }
 
-  CyclePlan plan = makePlan(state, snapshot, cause, extMask);
   Serial.printf("Decision: %s\n", plan.reason);
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
@@ -682,9 +729,15 @@ void setup() {
       Serial.printf("Adaptive NORMAL timer: %llu s for %.2f C\n",
                     static_cast<unsigned long long>(plan.sleepSeconds),
                     snapshot.waterTemperatureC);
+    } else if (rtcNormalSleepValid) {
+      Serial.printf(
+          "Adaptive NORMAL timer: %llu s (cached from %.2f C)\n",
+          static_cast<unsigned long long>(plan.sleepSeconds),
+          rtcLastWaterTemperatureC);
     } else {
-      Serial.printf("Adaptive NORMAL timer: %llu s (temperature invalid -> fallback)\n",
-                    static_cast<unsigned long long>(plan.sleepSeconds));
+      Serial.printf(
+          "Adaptive NORMAL timer: %llu s (no valid temperature -> fallback)\n",
+          static_cast<unsigned long long>(plan.sleepSeconds));
     }
   }
 #endif
