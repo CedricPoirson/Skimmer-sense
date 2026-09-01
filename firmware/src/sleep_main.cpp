@@ -428,10 +428,21 @@ CyclePlan makePlan(LevelState state,
 
   switch (state) {
     case LevelState::NORMAL:
-      if (snapshot.lowClosed) {
+      if (snapshot.lowClosed && !snapshot.highClosed) {
+        plan.nextState = LevelState::NORMAL;
+        plan.useZigbee = true;
+        plan.reportTemperature = true;
+        plan.reportFloats = true;
+        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+        plan.watchLow = true;
+        plan.watchHigh = true;
+        plan.watchMax = true;
+        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish fault state";
+      } else if (snapshot.lowClosed) {
         plan.nextState = LevelState::LOW_PENDING;
         plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
-        plan.reason = "LOW closed -> confirmation sleep; float wake disabled";
+        plan.watchLow = true;
+        plan.reason = "LOW closed -> continuous confirmation; wake if LOW reopens";
       } else {
         plan.nextState = LevelState::NORMAL;
         plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
@@ -457,6 +468,11 @@ CyclePlan makePlan(LevelState state,
         plan.watchLow = true;
         plan.watchMax = true;
         plan.reason = "LOW reopened during confirmation -> rejected as wave/bather motion";
+      } else if (!timerWake) {
+        plan.nextState = LevelState::LOW_PENDING;
+        plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
+        plan.watchLow = true;
+        plan.reason = "LOW confirmation interrupted -> restart full confirmation window";
       } else if (!snapshot.highClosed) {
         plan.nextState = LevelState::NORMAL;
         plan.useZigbee = true;
@@ -464,8 +480,9 @@ CyclePlan makePlan(LevelState state,
         plan.reportFloats = true;
         plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
         plan.watchLow = true;
+        plan.watchHigh = true;
         plan.watchMax = true;
-        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish fault state";
+        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN after continuous confirmation -> publish fault state";
       } else {
         plan.nextState = LevelState::WAIT_HIGH;
         plan.useZigbee = true;
@@ -474,7 +491,7 @@ CyclePlan makePlan(LevelState state,
         plan.sleepSeconds = SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS;
         plan.watchHigh = true;
         plan.watchMax = true;
-        plan.reason = "LOW confirmed -> publish ON/ON, then ignore LOW and watch HIGH";
+        plan.reason = "LOW continuously confirmed -> publish ON/ON, then ignore LOW and watch HIGH";
       }
       break;
 
@@ -519,18 +536,20 @@ CyclePlan makePlan(LevelState state,
   pinMode(PIN_DS18B20_DATA, INPUT);
   digitalWrite(PIN_DS18B20_POWER, LOW);
 
-  // If LOW became closed while we were awake in NORMAL, start confirmation now
-  // rather than arming the opposite edge and waiting for the long fallback timer.
+  // If LOW is CLOSED before sleeping in NORMAL, start/restart confirmation.
+  // Exclude WAIT_HIGH -> NORMAL because LOW may legitimately still be CLOSED
+  // when HIGH opens at the end of a refill.
   if (plan.nextState == LevelState::NORMAL &&
-      previousState == LevelState::NORMAL &&
+      previousState != LevelState::WAIT_HIGH &&
       plan.watchLow &&
-      digitalRead(PIN_FLOAT_LOW) == LOW) {
+      digitalRead(PIN_FLOAT_LOW) == LOW &&
+      digitalRead(PIN_FLOAT_HIGH) == LOW) {
 
-    Serial.println("LOW became CLOSED before sleep -> switching to LOW_PENDING.");
+    Serial.println("LOW CLOSED before sleep -> starting/restarting continuous confirmation.");
 
     plan.nextState = LevelState::LOW_PENDING;
     plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
-    plan.watchLow = false;
+    plan.watchLow = true;
     plan.watchHigh = false;
     plan.watchMax = false;
   }
