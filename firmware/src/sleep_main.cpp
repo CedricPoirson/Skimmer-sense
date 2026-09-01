@@ -150,6 +150,28 @@ const char *contactState(bool closed) {
   return closed ? "CLOSED" : "OPEN";
 }
 
+
+uint64_t normalSleepSecondsForTemperature(const SensorSnapshot &snapshot) {
+#ifdef SKIMMERSENSE_PRODUCTION_BUILD
+  if (!snapshot.temperatureValid) {
+    return SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+  }
+
+  const float t = snapshot.waterTemperatureC;
+
+  if (t >= 28.0f) return 1800ULL;   // 30 min
+  if (t >= 24.0f) return 3600ULL;   // 1 h
+  if (t >= 18.0f) return 7200ULL;   // 2 h
+  if (t >= 12.0f) return 14400ULL;  // 4 h
+  if (t >= 5.0f)  return 21600ULL;  // 6 h
+  if (t >= 3.0f)  return 7200ULL;   // 2 h
+
+  return 1800ULL;                    // < 3 C: 30 min
+#else
+  return SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+#endif
+}
+
 const char *wakeCauseName(esp_sleep_wakeup_cause_t cause) {
   switch (cause) {
     case ESP_SLEEP_WAKEUP_TIMER: return "timer";
@@ -326,6 +348,11 @@ bool configureZigbeeEndpoints(const SensorSnapshot &snapshot) {
 
 bool startZigbee() {
   esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
+
+  // Adaptive NORMAL sleep can reach 6 hours. Keep the Zigbee child
+  // relationship alive much longer than the default sleepy-device timeout.
+  zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout =
+      ESP_ZB_ED_AGING_TIMEOUT_2048MIN;
   zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 10000;
   Zigbee.setTimeout(10000);
 
@@ -526,6 +553,13 @@ CyclePlan makePlan(LevelState state,
       break;
   }
 
+  // Adaptive periodic NORMAL refresh is used only when the LOW
+  // float is OPEN. Fault states and LOW-confirmation logic keep their
+  // conservative fixed timers. GPIO wake remains immediate.
+  if (plan.nextState == LevelState::NORMAL && !snapshot.lowClosed) {
+    plan.sleepSeconds = normalSleepSecondsForTemperature(snapshot);
+  }
+
   return plan;
 }
 
@@ -641,6 +675,20 @@ void setup() {
 
   CyclePlan plan = makePlan(state, snapshot, cause, extMask);
   Serial.printf("Decision: %s\n", plan.reason);
+
+#ifdef SKIMMERSENSE_PRODUCTION_BUILD
+  if (plan.nextState == LevelState::NORMAL && !snapshot.lowClosed) {
+    if (snapshot.temperatureValid) {
+      Serial.printf("Adaptive NORMAL timer: %llu s for %.2f C\n",
+                    static_cast<unsigned long long>(plan.sleepSeconds),
+                    snapshot.waterTemperatureC);
+    } else {
+      Serial.printf("Adaptive NORMAL timer: %llu s (temperature invalid -> fallback)\n",
+                    static_cast<unsigned long long>(plan.sleepSeconds));
+    }
+  }
+#endif
+
 
   if (plan.useZigbee) {
     Serial.println("Preloading Zigbee attributes BEFORE Zigbee.begin()...");
