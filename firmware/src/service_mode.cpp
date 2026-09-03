@@ -5,10 +5,10 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <SPIFFS.h>
 #include <esp_attr.h>
 #include <esp_system.h>
 #include <stdarg.h>
-#include <stddef.h>
 
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
@@ -27,10 +27,11 @@ static constexpr char MDNS_HOSTNAME[] = "skimmersense";
 static constexpr uint32_t CYCLE_LOG_MAGIC = 0x534B4331UL;  // "SKC1"
 static constexpr size_t CYCLE_LOG_CAPACITY = 3072;
 static constexpr size_t SERVICE_LOG_CAPACITY = 8192;
-static constexpr uint8_t SCENARIO_MAX_CYCLES = 8;
-static constexpr size_t SCENARIO_LOG_CAPACITY = 8192;
+static constexpr uint8_t SCENARIO_MAX_CYCLES = 50;
+static constexpr size_t SCENARIO_LOG_MAX_BYTES = 196608;
 static constexpr char CAPTURE_REMAINING_KEY[] = "capremain";
-static constexpr char SCENARIO_LOG_KEY[] = "scenlog";
+static constexpr char CAPTURE_COUNT_KEY[] = "capcount";
+static constexpr char SCENARIO_LOG_PATH[] = "/scenario.log";
 
 struct RtcDiagnostics {
   uint32_t magic = 0;
@@ -82,61 +83,6 @@ struct RetainedCycleLog {
   char text[CYCLE_LOG_CAPACITY];
 };
 
-static constexpr uint32_t SCENARIO_LOG_MAGIC = 0x534B5331UL;  // "SKS1"
-struct PersistedScenarioLog {
-  uint32_t magic;
-  uint16_t length;
-  uint8_t cycleCount;
-  uint8_t truncated;
-  char text[SCENARIO_LOG_CAPACITY];
-};
-
-RTC_DATA_ATTR RtcDiagnostics rtcDiagnostics;
-RTC_NOINIT_ATTR RetainedCycleLog retainedCycleLog;
-PersistedScenarioLog scenarioLogWork;
-String serviceSessionLog;
-
-bool loadPersistedScenarioLog() {
-  Preferences prefs;
-  if (!prefs.begin("skm_diag", true)) return false;
-  const size_t headerSize = offsetof(PersistedScenarioLog, text);
-  const size_t storedSize = prefs.getBytesLength(SCENARIO_LOG_KEY);
-  scenarioLogWork = {};
-  const bool sizeOk =
-      storedSize > headerSize && storedSize <= sizeof(PersistedScenarioLog);
-  const bool readOk =
-      sizeOk &&
-      prefs.getBytes(SCENARIO_LOG_KEY,
-                     &scenarioLogWork,
-                     storedSize) == storedSize;
-  const bool ok =
-      readOk &&
-      scenarioLogWork.magic == SCENARIO_LOG_MAGIC &&
-      scenarioLogWork.length > 0 &&
-      scenarioLogWork.length < SCENARIO_LOG_CAPACITY &&
-      storedSize == headerSize + scenarioLogWork.length + 1 &&
-      scenarioLogWork.text[scenarioLogWork.length] == '\0';
-  prefs.end();
-  return ok;
-}
-
-void resetScenarioLog() {
-  scenarioLogWork = {};
-  scenarioLogWork.magic = SCENARIO_LOG_MAGIC;
-}
-
-void appendScenarioBytes(const char *data, size_t length) {
-  const size_t available =
-      SCENARIO_LOG_CAPACITY - 1 - scenarioLogWork.length;
-  const size_t copyLength = length < available ? length : available;
-  if (copyLength > 0) {
-    memcpy(scenarioLogWork.text + scenarioLogWork.length, data, copyLength);
-    scenarioLogWork.length += static_cast<uint16_t>(copyLength);
-    scenarioLogWork.text[scenarioLogWork.length] = '\0';
-  }
-  if (copyLength < length) scenarioLogWork.truncated = 1;
-}
-
 void appendServiceSessionLine(const String &line) {
   String entry = line;
   if (!entry.endsWith("\n")) entry += '\n';
@@ -153,7 +99,9 @@ void appendServiceSessionLine(const String &line) {
 
 String combinedLogText() {
   String text;
-  text.reserve(CYCLE_LOG_CAPACITY + serviceSessionLog.length() + 256);
+  const String persisted = skmPersistedCycleLogSnapshot();
+  text.reserve(CYCLE_LOG_CAPACITY + persisted.length() +
+               serviceSessionLog.length() + 384);
   text += F("=== LAST RETAINED PRODUCTION CYCLE ===\n");
   if (!skmCycleLogAvailable()) {
     text += F("No retained production-cycle log. A power loss, USB flash or first boot may have cleared it.\n");
@@ -165,7 +113,6 @@ String combinedLogText() {
   }
 
   text += F("\n=== LAST PERSISTED SCENARIO CAPTURE ===\n");
-  const String persisted = skmPersistedCycleLogSnapshot();
   text += persisted.length()
             ? persisted
             : String(F("No persistent production scenario has been saved yet.\n"));
@@ -426,15 +373,22 @@ String skmCycleLogSnapshot() {
 }
 
 bool skmRequestNextCycleCapture() {
+  if (!SPIFFS.begin(true)) return false;
+  if (SPIFFS.exists(SCENARIO_LOG_PATH) &&
+      !SPIFFS.remove(SCENARIO_LOG_PATH)) {
+    return false;
+  }
+
   Preferences prefs;
   if (!prefs.begin("skm_diag", false)) return false;
-  prefs.remove("capnext");  // Remove the obsolete one-cycle request, if present.
+  prefs.remove("capnext");
   prefs.remove("cyclelog");
-  prefs.remove(SCENARIO_LOG_KEY);
-  const bool ok =
+  prefs.remove("scenlog");
+  const bool countOk = prefs.putUChar(CAPTURE_COUNT_KEY, 0) > 0;
+  const bool remainingOk =
       prefs.putUChar(CAPTURE_REMAINING_KEY, SCENARIO_MAX_CYCLES) > 0;
   prefs.end();
-  return ok;
+  return countOk && remainingOk;
 }
 
 bool skmCancelCycleCapture() {
@@ -461,94 +415,115 @@ bool skmCycleCaptureRequested() {
 
 bool skmPersistCycleLogIfRequested(bool scenarioFinished) {
   Preferences prefs;
-  if (!prefs.begin("skm_diag", false)) return false;
+  if (!prefs.begin("skm_diag", true)) return false;
   uint8_t remaining = prefs.getUChar(CAPTURE_REMAINING_KEY, 0);
-  if (remaining == 0) {
-    prefs.end();
-    return false;
-  }
+  uint8_t cycleCount = prefs.getUChar(CAPTURE_COUNT_KEY, 0);
+  prefs.end();
+  if (remaining == 0) return false;
 
-  const size_t headerSize = offsetof(PersistedScenarioLog, text);
-  const size_t storedSize = prefs.getBytesLength(SCENARIO_LOG_KEY);
-  scenarioLogWork = {};
-  const bool sizeOk =
-      storedSize > headerSize && storedSize <= sizeof(PersistedScenarioLog);
-  const bool readOk =
-      sizeOk &&
-      prefs.getBytes(SCENARIO_LOG_KEY,
-                     &scenarioLogWork,
-                     storedSize) == storedSize;
-  const bool loaded =
-      readOk &&
-      scenarioLogWork.magic == SCENARIO_LOG_MAGIC &&
-      scenarioLogWork.length < SCENARIO_LOG_CAPACITY &&
-      storedSize == headerSize + scenarioLogWork.length + 1 &&
-      scenarioLogWork.text[scenarioLogWork.length] == '\0';
-  if (!loaded) resetScenarioLog();
+  if (!SPIFFS.begin(true)) return false;
+  File file = SPIFFS.open(SCENARIO_LOG_PATH, FILE_APPEND);
+  if (!file) return false;
 
   char header[64];
   const int headerLength = snprintf(
       header, sizeof(header),
       "\n--- Production wake #%u ---\n",
-      static_cast<unsigned>(scenarioLogWork.cycleCount + 1));
-  if (headerLength > 0) {
-    appendScenarioBytes(
-        header,
-        static_cast<size_t>(headerLength) < sizeof(header)
-          ? static_cast<size_t>(headerLength)
-          : sizeof(header) - 1);
+      static_cast<unsigned>(cycleCount + 1));
+  const size_t safeHeaderLength =
+      headerLength > 0
+        ? (static_cast<size_t>(headerLength) < sizeof(header)
+             ? static_cast<size_t>(headerLength)
+             : sizeof(header) - 1)
+        : 0;
+  const size_t required =
+      safeHeaderLength + retainedCycleLog.length + 96;
+  const bool capacityReached =
+      file.size() + required > SCENARIO_LOG_MAX_BYTES;
+
+  bool saved = !capacityReached;
+  if (saved && safeHeaderLength > 0) {
+    saved = file.write(
+                reinterpret_cast<const uint8_t *>(header),
+                safeHeaderLength) == safeHeaderLength;
   }
-  appendScenarioBytes(retainedCycleLog.text, retainedCycleLog.length);
-  if (retainedCycleLog.length == 0 ||
-      retainedCycleLog.text[retainedCycleLog.length - 1] != '\n') {
-    appendScenarioBytes("\n", 1);
+  if (saved && retainedCycleLog.length > 0) {
+    saved = file.write(
+                reinterpret_cast<const uint8_t *>(retainedCycleLog.text),
+                retainedCycleLog.length) == retainedCycleLog.length;
+  }
+  if (saved &&
+      (retainedCycleLog.length == 0 ||
+       retainedCycleLog.text[retainedCycleLog.length - 1] != '\n')) {
+    saved = file.write(static_cast<uint8_t>('\n')) == 1;
   }
 
-  ++scenarioLogWork.cycleCount;
-  if (remaining > 0) --remaining;
+  if (saved) {
+    ++cycleCount;
+    --remaining;
+  }
+
   const bool stop =
-      scenarioFinished ||
-      remaining == 0 ||
-      scenarioLogWork.truncated != 0;
-  if (stop) {
+      scenarioFinished || remaining == 0 || capacityReached || !saved;
+  if (saved && stop) {
     const char *stopMessage =
         scenarioFinished
           ? "[scenario capture stopped: state machine returned to NORMAL]\n"
           : remaining == 0
-              ? "[scenario capture stopped: eight-cycle limit reached]\n"
+              ? "[scenario capture stopped: fifty-cycle limit reached]\n"
               : "[scenario capture stopped: log capacity reached]\n";
-    appendScenarioBytes(stopMessage, strlen(stopMessage));
+    saved = file.print(stopMessage) == strlen(stopMessage);
   }
+  file.flush();
+  file.close();
 
-  // Store only the populated prefix instead of rewriting the full 8 KiB
-  // capacity on every wake. This keeps multi-wake NVS updates reliable.
-  const size_t blobSize =
-      offsetof(PersistedScenarioLog, text) +
-      scenarioLogWork.length + 1;
-  const bool saved =
-      prefs.putBytes(SCENARIO_LOG_KEY,
-                     &scenarioLogWork,
-                     blobSize) == blobSize;
-  if (saved) {
-    if (stop) prefs.remove(CAPTURE_REMAINING_KEY);
-    else prefs.putUChar(CAPTURE_REMAINING_KEY, remaining);
+  Preferences updatePrefs;
+  if (!updatePrefs.begin("skm_diag", false)) return false;
+  const bool countSaved =
+      updatePrefs.putUChar(CAPTURE_COUNT_KEY, cycleCount) > 0;
+  bool stateSaved = true;
+  if (stop) {
+    updatePrefs.remove(CAPTURE_REMAINING_KEY);
+  } else {
+    stateSaved =
+        updatePrefs.putUChar(CAPTURE_REMAINING_KEY, remaining) > 0;
   }
-  prefs.end();
-  return saved;
+  updatePrefs.end();
+  return saved && countSaved && stateSaved;
 }
 
 String skmPersistedCycleLogSnapshot() {
-  if (!loadPersistedScenarioLog()) return String();
+  if (!SPIFFS.begin(true) || !SPIFFS.exists(SCENARIO_LOG_PATH)) {
+    return String();
+  }
+
+  File file = SPIFFS.open(SCENARIO_LOG_PATH, FILE_READ);
+  if (!file) return String();
+
+  Preferences prefs;
+  uint8_t cycleCount = 0;
+  if (prefs.begin("skm_diag", true)) {
+    cycleCount = prefs.getUChar(CAPTURE_COUNT_KEY, 0);
+    prefs.end();
+  }
 
   String text;
-  text.reserve(scenarioLogWork.length + 96);
+  const size_t fileSize = file.size();
+  text.reserve(fileSize + 96);
   text += F("Captured production wakes: ");
-  text += String(scenarioLogWork.cycleCount);
+  text += String(cycleCount);
+  text += F(" / maximum ");
+  text += String(SCENARIO_MAX_CYCLES);
   text += F("\n");
-  text += scenarioLogWork.text;
-  if (scenarioLogWork.truncated) {
-    text += F("\n[persisted scenario log truncated]\n");
+
+  char buffer[256];
+  while (file.available()) {
+    const size_t readLength = file.read(
+        reinterpret_cast<uint8_t *>(buffer), sizeof(buffer));
+    if (readLength == 0) break;
+    text.concat(buffer, static_cast<unsigned int>(readLength));
   }
+  file.close();
   return text;
 }
 bool skmServiceRequested() {

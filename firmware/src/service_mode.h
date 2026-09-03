@@ -48,7 +48,7 @@ String skmCycleLogSnapshot();
 
 // A capture request is stored in NVS by SERVICE mode. Successive production
 // cycles are appended until the state machine returns to NORMAL or the
-// eight-cycle safety limit is reached.
+// fifty-cycle safety limit is reached.
 bool skmRequestNextCycleCapture();
 bool skmCancelCycleCapture();
 bool skmCycleCaptureRequested();

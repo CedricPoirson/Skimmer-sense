@@ -114,7 +114,7 @@ The production-cycle trace in RTC memory is flash-write-free. However, a
 hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
 state-machine test, use **Capture next scenario** on the SERVICE page. The
 firmware then appends successive production wakes to one NVS log. Capture stops
-automatically when the state machine reaches `NORMAL`, when the eight-wake
+automatically when the state machine reaches `NORMAL`, when the fifty-wake
 safety limit is reached, or when **Cancel capture** is pressed.
 
 Recommended LOW-to-HIGH scenario workflow:
@@ -130,9 +130,11 @@ Recommended LOW-to-HIGH scenario workflow:
    `/logs-download`. The trace is listed chronologically as
    `Production wake #1`, `#2`, and so on.
 
-Each captured wake causes one deliberate NVS write, but only while this manual
-capture is armed. Normal production operation still creates no continuous log
-writes. SERVICE-session events are kept in RAM and refresh in the browser every
+The full multi-wake trace is appended to the dedicated SPIFFS partition, while
+NVS stores only the small remaining-wake counter. Up to 50 complete wakes can
+be retained, with a 192 KiB log-size safety limit. Each captured wake causes one
+deliberate flash append, but only while this manual capture is armed. Normal
+production operation still creates no continuous log writes. SERVICE-session events are kept in RAM and refresh in the browser every
 two seconds.
 
 ## OTA update
