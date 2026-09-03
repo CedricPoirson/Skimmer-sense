@@ -39,6 +39,14 @@
 #define SKIMMERSENSE_ZIGBEE_CHANNEL 20
 #endif
 
+#ifndef SKIMMERSENSE_ZIGBEE_TX_POWER_DBM
+#define SKIMMERSENSE_ZIGBEE_TX_POWER_DBM 20
+#endif
+
+#ifndef SKIMMERSENSE_ZIGBEE_RETRY_SECONDS
+#define SKIMMERSENSE_ZIGBEE_RETRY_SECONDS 300ULL
+#endif
+
 static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
               SKIMMERSENSE_ZIGBEE_CHANNEL <= 26,
               "Zigbee channel must be between 11 and 26");
@@ -386,6 +394,55 @@ bool configureZigbeeEndpoints(const SensorSnapshot &snapshot) {
   return ok;
 }
 
+void configureZigbeeTxPower() {
+  int8_t beforeDbm = 0;
+  int8_t afterDbm = 0;
+
+  if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+    Serial.println("Zigbee TX power: lock unavailable; keeping stack default");
+    skmCycleLogAppend("Zigbee TX power: lock unavailable; stack default kept");
+    return;
+  }
+
+  esp_zb_get_tx_power(&beforeDbm);
+  if (beforeDbm < SKIMMERSENSE_ZIGBEE_TX_POWER_DBM) {
+    esp_zb_set_tx_power(SKIMMERSENSE_ZIGBEE_TX_POWER_DBM);
+  }
+  esp_zb_get_tx_power(&afterDbm);
+  esp_zb_lock_release();
+
+  Serial.printf("Zigbee TX power: %d dBm -> %d dBm%s\n",
+                static_cast<int>(beforeDbm),
+                static_cast<int>(afterDbm),
+                beforeDbm < SKIMMERSENSE_ZIGBEE_TX_POWER_DBM
+                    ? " (target applied)"
+                    : " (stack value retained)");
+  skmCycleLogAppend("Zigbee TX power: %d dBm -> %d dBm%s",
+                    static_cast<int>(beforeDbm),
+                    static_cast<int>(afterDbm),
+                    beforeDbm < SKIMMERSENSE_ZIGBEE_TX_POWER_DBM
+                        ? " (target applied)"
+                        : " (stack value retained)");
+}
+
+void scheduleZigbeeRecovery(CyclePlan &plan, const char *failureStage) {
+  const uint64_t plannedSleepSeconds = plan.sleepSeconds;
+  if (plan.sleepSeconds > SKIMMERSENSE_ZIGBEE_RETRY_SECONDS) {
+    plan.sleepSeconds = SKIMMERSENSE_ZIGBEE_RETRY_SECONDS;
+  }
+
+  Serial.printf(
+      "Zigbee recovery after %s: retry in %llu s (planned interval was %llu s)\n",
+      failureStage,
+      static_cast<unsigned long long>(plan.sleepSeconds),
+      static_cast<unsigned long long>(plannedSleepSeconds));
+  skmCycleLogAppend(
+      "Zigbee recovery after %s: retry in %llu s (planned interval was %llu s)",
+      failureStage,
+      static_cast<unsigned long long>(plan.sleepSeconds),
+      static_cast<unsigned long long>(plannedSleepSeconds));
+}
+
 bool startZigbee() {
   esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
 
@@ -421,6 +478,9 @@ bool startZigbee() {
                 static_cast<unsigned long>(beginElapsed));
   skmCycleLogAppend("Zigbee: stack started in %lu ms",
                     static_cast<unsigned long>(beginElapsed));
+
+  // ZBOSS is initialized now; set power before network reconnection.
+  configureZigbeeTxPower();
 
   Serial.print("Waiting for Zigbee network");
   const uint32_t startedAt = millis();
@@ -851,10 +911,12 @@ void setup() {
     Serial.println("Preloading Zigbee attributes BEFORE Zigbee.begin()...");
     if (!configureZigbeeEndpoints(snapshot)) {
       Serial.println("Preload/configuration FAILED; sleeping without Zigbee.");
+      scheduleZigbeeRecovery(plan, "endpoint configuration failure");
       plan.useZigbee = false;
       plan.reportTemperature = false;
       plan.reportFloats = false;
     } else if (!startZigbee()) {
+      scheduleZigbeeRecovery(plan, "startup/reconnection failure");
       plan.useZigbee = false;
       plan.reportTemperature = false;
       plan.reportFloats = false;
@@ -901,6 +963,9 @@ void setup() {
                     reportsOk ? "ALL OK" : "PARTIAL/FAILED");
       skmCycleLogAppend("Zigbee cycle survived. Reports queued: %s",
                         reportsOk ? "ALL OK" : "PARTIAL/FAILED");
+      if (!reportsOk) {
+        scheduleZigbeeRecovery(plan, "report failure");
+      }
     }
   } else {
     Serial.println("Zigbee cycle intentionally skipped for this state transition.");

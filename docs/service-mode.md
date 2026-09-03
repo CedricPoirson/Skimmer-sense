@@ -137,8 +137,19 @@ The anti-wave and production profiles constrain discovery/reconnection to
 **Zigbee channel 20**, matching the deployed coordinator. This avoids scanning
 unneeded channels during a short battery-powered wake. If the coordinator
 channel changes, update `SKIMMERSENSE_ZIGBEE_CHANNEL` in `platformio.ini`
-before rebuilding. After the three attribute reports are queued, the firmware
-now remains awake for **2 seconds** before entering deep sleep.
+before rebuilding.
+
+Once ZBOSS starts, the firmware reads the current Zigbee transmit power. If it
+is below the configured **20 dBm** target, it applies 20 dBm and reads the value
+back; both values are written to the serial and persistent scenario logs. This
+happens before waiting for network reconnection. After the three attribute
+reports are queued, the firmware remains awake for **2 seconds** before entering
+deep sleep.
+
+If endpoint configuration, Zigbee startup/reconnection, or attribute queuing
+fails, the next timer wake is capped at **5 minutes**. Float GPIO wake sources
+and the state-machine state remain unchanged. The normal temperature-dependent
+interval resumes automatically after a successful Zigbee cycle.
 
 The production-cycle trace in RTC memory is flash-write-free. However, a
 hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
