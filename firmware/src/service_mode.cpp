@@ -9,6 +9,7 @@
 #include <esp_attr.h>
 #include <esp_system.h>
 #include <stdarg.h>
+#include "skm_radio.h"
 
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
@@ -610,13 +611,8 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   skmDiagSetStage(SkmDiagStage::SERVICE);
   serviceSessionLog = "";
 
-  // XIAO ESP32-C6 RF switch: GPIO3 LOW enables switch control and GPIO14 LOW
-  // selects the onboard ceramic antenna. SERVICE mode never starts Zigbee.
-  pinMode(WIFI_ENABLE, OUTPUT);
-  digitalWrite(WIFI_ENABLE, LOW);
-  delay(100);
-  pinMode(WIFI_ANT_CONFIG, OUTPUT);
-  digitalWrite(WIFI_ANT_CONFIG, LOW);
+  // Wi-Fi and Zigbee share the same 2.4 GHz RF path on the XIAO.
+  skmSelectRadioAntenna();
 
   const uint32_t suffix = static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFFFFULL);
   char suffixText[7];
@@ -661,6 +657,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   Serial.println();
   Serial.println("========== SERVICE MODE ==========");
   Serial.println("SERVICE jumper: D6/GPIO16 -> GND");
+  Serial.printf("RF antenna : %s\n", skmRadioAntennaName());
   Serial.printf("Fallback AP : %s\n", apSsid.c_str());
   Serial.printf("AP password : %s\n", apPassword.c_str());
   Serial.printf("AP address  : http://%s/\n", apIp.toString().c_str());
@@ -678,6 +675,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   Serial.println("==================================");
 
   appendServiceSessionLine(String(F("SERVICE mode started")));
+  appendServiceSessionLine(String(F("RF antenna: ")) + skmRadioAntennaName());
   appendServiceSessionLine(String(F("Fallback AP: ")) + apSsid +
                            (apOk ? F(" (started)") : F(" (FAILED)")));
   if (staConnected) {

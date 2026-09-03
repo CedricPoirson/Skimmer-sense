@@ -45,6 +45,18 @@ Normally there is therefore no need to know the DHCP address. If `.local` name r
 
 The ESP32-C6 Wi-Fi radio is 2.4 GHz. The configured SSID therefore needs a 2.4 GHz network (or a combined SSID that accepts 2.4 GHz clients).
 
+## External antenna
+
+The anti-wave and production profiles set
+`SKIMMERSENSE_EXTERNAL_ANTENNA=1`. At every production or SERVICE boot, GPIO3
+enables the XIAO RF switch and GPIO14 selects the external U.FL connector.
+Wi-Fi and Zigbee therefore use the same external 2.4 GHz antenna. The serial
+console and persistent scenario log identify the selected RF path.
+
+The external antenna must be connected before using these profiles. To return
+to the onboard ceramic antenna, set `SKIMMERSENSE_EXTERNAL_ANTENNA=0` in both
+profiles in `firmware/platformio.ini` and rebuild.
+
 ## Home Wi-Fi credentials
 
 Credentials must **not** be committed to GitHub.

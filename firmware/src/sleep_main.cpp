@@ -5,6 +5,7 @@
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 #include "soc/soc_caps.h"
+#include "skm_radio.h"
 
 #ifndef ZIGBEE_MODE_ED
 #error "SkimmerSense must be built in Zigbee End Device mode"
@@ -735,9 +736,11 @@ CyclePlan makePlan(LevelState state,
 
 void setup() {
   Serial.begin(115200);
+  skmSelectRadioAntenna();
   delay(SKIMMERSENSE_SERIAL_STARTUP_MS);
   skmCycleLogBegin();
   skmCycleLogAppend("Firmware: %s / %s", FIRMWARE_VERSION, FIRMWARE_FLAVOR);
+  skmCycleLogAppend("RF antenna: %s", skmRadioAntennaName());
 
   const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   const uint64_t extMask = currentExt1Mask();
@@ -748,6 +751,7 @@ void setup() {
   Serial.printf(" SkimmerSense v%s\n", FIRMWARE_VERSION);
   Serial.printf(" %s\n", FIRMWARE_FLAVOR);
   Serial.println(" Battery monitoring: MAX17048 enabled");
+  Serial.printf(" RF antenna: %s\n", skmRadioAntennaName());
   Serial.println(" Zigbee Power Configuration disabled (ZBOSS workaround)");
   Serial.println("========================================");
   printWakeReason();
