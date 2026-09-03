@@ -34,6 +34,14 @@
 #define SKIMMERSENSE_ZIGBEE_WAIT_MS 30000UL
 #endif
 
+#ifndef SKIMMERSENSE_ZIGBEE_CHANNEL
+#define SKIMMERSENSE_ZIGBEE_CHANNEL 20
+#endif
+
+static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
+              SKIMMERSENSE_ZIGBEE_CHANNEL <= 26,
+              "Zigbee channel must be between 11 and 26");
+
 #ifndef SKIMMERSENSE_SERIAL_STARTUP_MS
 #define SKIMMERSENSE_SERIAL_STARTUP_MS 1200UL
 #endif
@@ -386,6 +394,15 @@ bool startZigbee() {
       ESP_ZB_ED_AGING_TIMEOUT_2048MIN;
   zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 10000;
   Zigbee.setTimeout(SKIMMERSENSE_ZIGBEE_BEGIN_TIMEOUT_MS);
+
+  const uint32_t primaryChannelMask = 1UL << SKIMMERSENSE_ZIGBEE_CHANNEL;
+  Zigbee.setPrimaryChannelMask(primaryChannelMask);
+  Serial.printf("Zigbee primary channel: %u (mask 0x%08lX)\n",
+                static_cast<unsigned>(SKIMMERSENSE_ZIGBEE_CHANNEL),
+                static_cast<unsigned long>(primaryChannelMask));
+  skmCycleLogAppend("Zigbee primary channel: %u (mask 0x%08lX)",
+                    static_cast<unsigned>(SKIMMERSENSE_ZIGBEE_CHANNEL),
+                    static_cast<unsigned long>(primaryChannelMask));
 
   Serial.println("Starting Zigbee sleepy End Device...");
   skmCycleLogAppend("Zigbee: starting sleepy End Device");

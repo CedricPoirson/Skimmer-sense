@@ -121,6 +121,13 @@ Zigbee startup has two separately logged 30-second limits: one for
 normal successful wake usually completes much sooner, so the longer limits only
 increase awake time when Zigbee is already failing.
 
+The anti-wave and production profiles constrain discovery/reconnection to
+**Zigbee channel 20**, matching the deployed coordinator. This avoids scanning
+unneeded channels during a short battery-powered wake. If the coordinator
+channel changes, update `SKIMMERSENSE_ZIGBEE_CHANNEL` in `platformio.ini`
+before rebuilding. After the three attribute reports are queued, the firmware
+now remains awake for **2 seconds** before entering deep sleep.
+
 The production-cycle trace in RTC memory is flash-write-free. However, a
 hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
 long-running test, use **Capture next 50 wakes** on the SERVICE page. The
