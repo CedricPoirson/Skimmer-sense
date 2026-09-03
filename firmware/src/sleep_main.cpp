@@ -425,6 +425,48 @@ void configureZigbeeTxPower() {
                         : " (stack value retained)");
 }
 
+bool logZigbeeParentReception() {
+  esp_zb_nwk_info_iterator_t iterator = ESP_ZB_NWK_INFO_ITERATOR_INIT;
+  esp_zb_nwk_neighbor_info_t neighbor{};
+  bool found = false;
+  int8_t parentRssiDbm = 0;
+  uint8_t parentLqi = 0;
+  uint16_t parentShortAddress = 0xFFFF;
+
+  if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+    Serial.println("Zigbee parent RX: unavailable (stack lock)");
+    skmCycleLogAppend("Zigbee parent RX: unavailable (stack lock)");
+    return false;
+  }
+
+  while (esp_zb_nwk_get_next_neighbor(&iterator, &neighbor) == ESP_OK) {
+    if (neighbor.relationship == ESP_ZB_NWK_RELATIONSHIP_PARENT) {
+      parentRssiDbm = neighbor.rssi;
+      parentLqi = neighbor.lqi;
+      parentShortAddress = neighbor.short_addr;
+      found = true;
+      break;
+    }
+  }
+  esp_zb_lock_release();
+
+  if (!found) {
+    Serial.println("Zigbee parent RX: unavailable on this wake");
+    skmCycleLogAppend("Zigbee parent RX: unavailable on this wake");
+    return false;
+  }
+
+  Serial.printf("Zigbee parent RX: RSSI %d dBm / LQI %u / short 0x%04X\n",
+                static_cast<int>(parentRssiDbm),
+                static_cast<unsigned>(parentLqi),
+                static_cast<unsigned>(parentShortAddress));
+  skmCycleLogAppend("Zigbee parent RX: RSSI %d dBm / LQI %u / short 0x%04X",
+                    static_cast<int>(parentRssiDbm),
+                    static_cast<unsigned>(parentLqi),
+                    static_cast<unsigned>(parentShortAddress));
+  return true;
+}
+
 void scheduleZigbeeRecovery(CyclePlan &plan, const char *failureStage) {
   const uint64_t plannedSleepSeconds = plan.sleepSeconds;
   if (plan.sleepSeconds > SKIMMERSENSE_ZIGBEE_RETRY_SECONDS) {
@@ -924,6 +966,10 @@ void setup() {
       Serial.printf("Connected; idling %lu ms without runtime attribute writes...\n",
                     static_cast<unsigned long>(SKIMMERSENSE_ZIGBEE_IDLE_MS));
       delay(SKIMMERSENSE_ZIGBEE_IDLE_MS);
+
+      // Read the parent entry already learned by the stack. This is a local
+      // diagnostic lookup and does not transmit an extra Zigbee frame.
+      logZigbeeParentReception();
 
       bool reportsOk = true;
       if (plan.reportTemperature && snapshot.temperatureValid) {
