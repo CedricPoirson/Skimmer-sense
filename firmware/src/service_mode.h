@@ -46,6 +46,13 @@ bool skmCycleLogAvailable();
 bool skmCycleLogIsComplete();
 String skmCycleLogSnapshot();
 
+// A capture request is stored in NVS by SERVICE mode. Exactly one subsequent
+// production cycle is then persisted before deep sleep and the request clears.
+bool skmRequestNextCycleCapture();
+bool skmCycleCaptureRequested();
+bool skmPersistCycleLogIfRequested();
+String skmPersistedCycleLogSnapshot();
+
 const char *skmDiagStageName(SkmDiagStage stage);
 
 // Starts a battery-powered local maintenance access point and never returns.

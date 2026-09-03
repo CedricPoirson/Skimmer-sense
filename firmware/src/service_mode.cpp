@@ -26,6 +26,8 @@ static constexpr char MDNS_HOSTNAME[] = "skimmersense";
 static constexpr uint32_t CYCLE_LOG_MAGIC = 0x534B4331UL;  // "SKC1"
 static constexpr size_t CYCLE_LOG_CAPACITY = 3072;
 static constexpr size_t SERVICE_LOG_CAPACITY = 8192;
+static constexpr char CAPTURE_REQUEST_KEY[] = "capnext";
+static constexpr char CAPTURE_LOG_KEY[] = "cyclelog";
 
 struct RtcDiagnostics {
   uint32_t magic = 0;
@@ -81,6 +83,20 @@ RTC_DATA_ATTR RtcDiagnostics rtcDiagnostics;
 RTC_NOINIT_ATTR RetainedCycleLog retainedCycleLog;
 String serviceSessionLog;
 
+bool loadPersistedCycleLog(RetainedCycleLog &log) {
+  Preferences prefs;
+  if (!prefs.begin("skm_diag", true)) return false;
+  const size_t storedSize = prefs.getBytesLength(CAPTURE_LOG_KEY);
+  const bool ok =
+      storedSize == sizeof(RetainedCycleLog) &&
+      prefs.getBytes(CAPTURE_LOG_KEY, &log, sizeof(log)) == sizeof(log) &&
+      log.magic == CYCLE_LOG_MAGIC &&
+      log.length > 0 &&
+      log.length < CYCLE_LOG_CAPACITY;
+  prefs.end();
+  return ok;
+}
+
 void appendServiceSessionLine(const String &line) {
   String entry = line;
   if (!entry.endsWith("\n")) entry += '\n';
@@ -107,6 +123,15 @@ String combinedLogText() {
               : F("Status: INCOMPLETE (cycle interrupted before deep sleep)\n");
     text += skmCycleLogSnapshot();
   }
+
+  text += F("\n=== LAST PERSISTED ON-DEMAND CAPTURE ===\n");
+  const String persisted = skmPersistedCycleLogSnapshot();
+  text += persisted.length()
+            ? persisted
+            : String(F("No on-demand production capture has been saved yet.\n"));
+
+  text += F("\nCapture next production cycle: ");
+  text += skmCycleCaptureRequested() ? F("ARMED\n") : F("not armed\n");
 
   text += F("\n=== CURRENT SERVICE SESSION ===\n");
   text += serviceSessionLog.length()
@@ -354,6 +379,58 @@ String skmCycleLogSnapshot() {
   return text;
 }
 
+bool skmRequestNextCycleCapture() {
+  Preferences prefs;
+  if (!prefs.begin("skm_diag", false)) return false;
+  const bool ok = prefs.putBool(CAPTURE_REQUEST_KEY, true) > 0;
+  prefs.end();
+  return ok;
+}
+
+bool skmCycleCaptureRequested() {
+  Preferences prefs;
+  if (!prefs.begin("skm_diag", true)) return false;
+  const bool requested = prefs.getBool(CAPTURE_REQUEST_KEY, false);
+  prefs.end();
+  return requested;
+}
+
+bool skmPersistCycleLogIfRequested() {
+  Preferences prefs;
+  if (!prefs.begin("skm_diag", false)) return false;
+  if (!prefs.getBool(CAPTURE_REQUEST_KEY, false)) {
+    prefs.end();
+    return false;
+  }
+
+  const bool valid =
+      retainedCycleLog.magic == CYCLE_LOG_MAGIC &&
+      retainedCycleLog.length > 0 &&
+      retainedCycleLog.length < CYCLE_LOG_CAPACITY;
+  const bool saved =
+      valid &&
+      prefs.putBytes(CAPTURE_LOG_KEY,
+                     &retainedCycleLog,
+                     sizeof(retainedCycleLog)) == sizeof(retainedCycleLog);
+  if (saved) prefs.remove(CAPTURE_REQUEST_KEY);
+  prefs.end();
+  return saved;
+}
+
+String skmPersistedCycleLogSnapshot() {
+  RetainedCycleLog log{};
+  if (!loadPersistedCycleLog(log)) return String();
+
+  String text;
+  text.reserve(log.length + 80);
+  text += log.complete
+            ? F("Status: complete (deep sleep reached)\n")
+            : F("Status: INCOMPLETE\n");
+  text += log.text;
+  if (log.truncated) text += F("\n[persisted log truncated]\n");
+  return text;
+}
+
 bool skmServiceRequested() {
   pinMode(SKIMMERSENSE_SERVICE_PIN, INPUT_PULLUP);
   delay(5);
@@ -530,6 +607,17 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
                       staConnected, staIp, mdnsOk);
   };
 
+  server.on("/capture-next", HTTP_POST, [&]() {
+    const bool armed = skmRequestNextCycleCapture();
+    appendServiceSessionLine(
+        armed ? String(F("Next production-cycle capture ARMED"))
+              : String(F("FAILED to arm next production-cycle capture")));
+    server.sendHeader("Location", "/", true);
+    server.send(armed ? 303 : 500,
+                "text/plain; charset=utf-8",
+                armed ? "Capture armed" : "Unable to arm capture");
+  });
+
   server.on("/logs.txt", HTTP_GET, [&]() {
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/plain; charset=utf-8", combinedLogText());
@@ -572,6 +660,17 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
     }
     html += diagnosticsHtml();
     html += resetLogHtml();
+    html += F("<h2>Production-cycle capture</h2><div class='card'>");
+    if (skmCycleCaptureRequested()) {
+      html += F("<p class='ok'><strong>ARMED:</strong> the next production "
+                "cycle will be saved once, then capture will turn off.</p>");
+    } else {
+      html += F("<p>Save one production cycle across RESET without continuous "
+                "flash writes.</p><form method='POST' action='/capture-next'>"
+                "<button type='submit'>Capture next production cycle</button>"
+                "</form>");
+    }
+    html += F("</div>");
     html += F("<h2>Logs</h2><div class='card'><p>"
               "<a href='/logs'>Open live Wi-Fi logs</a> | "
               "<a href='/logs-download'>Download logs</a></p>"

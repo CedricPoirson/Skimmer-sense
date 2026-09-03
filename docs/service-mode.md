@@ -110,12 +110,23 @@ The service page currently shows:
 
 Normal timer/GPIO deep-sleep wakes do not write the reset history to flash, so ordinary operation does not create continuous NVS wear. Power-on, manual/software reset, panic, watchdog and brownout resets are retained for later inspection.
 
-The production-cycle trace is also flash-write-free. It is marked **complete**
-only immediately before deep sleep; if the cycle stops earlier, SERVICE mode
-shows it as **INCOMPLETE**. Fit the SERVICE jumper and press RESET without
-removing power to preserve this RTC no-init trace. A full power loss or USB
-flash may clear it. SERVICE-session events are kept in RAM and refresh in the
-browser every two seconds.
+The production-cycle trace in RTC memory is flash-write-free. However, a
+hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
+test, use **Capture next production cycle** on the SERVICE page. This stores an
+NVS request, saves exactly one subsequent production cycle before deep sleep,
+then clears the request automatically. The captured log therefore survives
+RESET and power loss without causing continuous flash writes.
+
+Recommended capture workflow:
+
+1. In SERVICE mode, click **Capture next production cycle**.
+2. Remove the SERVICE jumper and reboot.
+3. Let the production cycle reach deep sleep.
+4. Refit the SERVICE jumper and press RESET.
+5. Open `/logs` or download `/logs-download`.
+
+SERVICE-session events are kept in RAM and refresh in the browser every two
+seconds.
 
 ## OTA update
 

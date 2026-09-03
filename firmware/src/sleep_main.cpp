@@ -672,7 +672,16 @@ CyclePlan makePlan(LevelState state,
   skmCycleLogAppend("Deep sleep: %llu s / GPIO wake %s",
                     static_cast<unsigned long long>(plan.sleepSeconds),
                     wakeOk ? "armed as planned" : "PARTIAL/FAILED");
+  const bool captureRequested = skmCycleCaptureRequested();
+  if (captureRequested) {
+    skmCycleLogAppend("Persistent on-demand capture: requested");
+  }
   skmCycleLogComplete();
+  if (captureRequested) {
+    const bool captureSaved = skmPersistCycleLogIfRequested();
+    Serial.printf("Persistent cycle capture: %s\n",
+                  captureSaved ? "SAVED" : "FAILED");
+  }
   Serial.flush();
   delay(20);
   esp_deep_sleep_start();
