@@ -102,9 +102,20 @@ The service page currently shows:
 - free heap;
 - ESP reset reason;
 - retained diagnostic cycle information;
-- the eight most recent **non-deep-sleep resets** stored in NVS.
+- the eight most recent **non-deep-sleep resets** stored in NVS;
+- a live Wi-Fi log page at `/logs`;
+- a downloadable text log at `/logs-download`;
+- the last production-cycle trace retained in RTC no-init memory, including
+  wake cause, state, sensors, decision, Zigbee outcome and planned sleep.
 
 Normal timer/GPIO deep-sleep wakes do not write the reset history to flash, so ordinary operation does not create continuous NVS wear. Power-on, manual/software reset, panic, watchdog and brownout resets are retained for later inspection.
+
+The production-cycle trace is also flash-write-free. It is marked **complete**
+only immediately before deep sleep; if the cycle stops earlier, SERVICE mode
+shows it as **INCOMPLETE**. Fit the SERVICE jumper and press RESET without
+removing power to preserve this RTC no-init trace. A full power loss or USB
+flash may clear it. SERVICE-session events are kept in RAM and refresh in the
+browser every two seconds.
 
 ## OTA update
 

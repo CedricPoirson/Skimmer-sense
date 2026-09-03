@@ -36,6 +36,16 @@ void skmDiagSetZigbeeConnected(bool connected);
 void skmDiagSetReportsResult(bool ok);
 void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds);
 
+// Retained production-cycle trace. The buffer lives in RTC no-init memory:
+// normal cycles never write it to flash, and a RESET into SERVICE mode can
+// display the last cycle. A power loss intentionally clears its validity.
+void skmCycleLogBegin();
+void skmCycleLogAppend(const char *format, ...);
+void skmCycleLogComplete();
+bool skmCycleLogAvailable();
+bool skmCycleLogIsComplete();
+String skmCycleLogSnapshot();
+
 const char *skmDiagStageName(SkmDiagStage stage);
 
 // Starts a battery-powered local maintenance access point and never returns.

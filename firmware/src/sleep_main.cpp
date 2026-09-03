@@ -384,8 +384,10 @@ bool startZigbee() {
   Zigbee.setTimeout(10000);
 
   Serial.println("Starting Zigbee sleepy End Device...");
+  skmCycleLogAppend("Zigbee: starting sleepy End Device");
   if (!Zigbee.begin(&zigbeeConfig, false)) {
     Serial.println("Zigbee begin failed");
+    skmCycleLogAppend("Zigbee: begin FAILED");
     return false;
   }
 
@@ -399,10 +401,12 @@ bool startZigbee() {
 
   if (!Zigbee.connected()) {
     Serial.println("Zigbee reconnect timeout");
+    skmCycleLogAppend("Zigbee: reconnect TIMEOUT");
     return false;
   }
 
   Serial.println("Zigbee connected!");
+  skmCycleLogAppend("Zigbee: connected");
   return true;
 }
 
@@ -419,6 +423,7 @@ bool sendSafeReport(uint8_t endpoint, uint16_t clusterId, uint16_t attributeId, 
   Serial.printf("Report %-12s: queue...\n", label);
   if (!esp_zb_lock_acquire(portMAX_DELAY)) {
     Serial.printf("Report %-12s: Zigbee lock FAILED\n", label);
+    skmCycleLogAppend("Report %s: Zigbee lock FAILED", label);
     return false;
   }
   const esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report);
@@ -426,9 +431,12 @@ bool sendSafeReport(uint8_t endpoint, uint16_t clusterId, uint16_t attributeId, 
 
   if (err != ESP_OK) {
     Serial.printf("Report %-12s: FAILED 0x%x (%s)\n", label, err, esp_err_to_name(err));
+    skmCycleLogAppend("Report %s: FAILED 0x%x (%s)",
+                      label, err, esp_err_to_name(err));
     return false;
   }
   Serial.printf("Report %-12s: queued OK\n", label);
+  skmCycleLogAppend("Report %s: queued OK", label);
   return true;
 }
 
@@ -660,6 +668,11 @@ CyclePlan makePlan(LevelState state,
                 static_cast<unsigned long long>(plan.sleepSeconds),
                 wakeOk ? "armed as planned" : "PARTIAL/FAILED");
   Serial.println("Going to deep sleep now.");
+  skmCycleLogAppend("Next state: %s", stateName(plan.nextState));
+  skmCycleLogAppend("Deep sleep: %llu s / GPIO wake %s",
+                    static_cast<unsigned long long>(plan.sleepSeconds),
+                    wakeOk ? "armed as planned" : "PARTIAL/FAILED");
+  skmCycleLogComplete();
   Serial.flush();
   delay(20);
   esp_deep_sleep_start();
@@ -669,6 +682,8 @@ CyclePlan makePlan(LevelState state,
 void setup() {
   Serial.begin(115200);
   delay(SKIMMERSENSE_SERIAL_STARTUP_MS);
+  skmCycleLogBegin();
+  skmCycleLogAppend("Firmware: %s / %s", FIRMWARE_VERSION, FIRMWARE_FLAVOR);
 
   const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   const uint64_t extMask = currentExt1Mask();
@@ -683,6 +698,12 @@ void setup() {
   Serial.println("========================================");
   printWakeReason();
   Serial.printf("RTC state: %s\n", stateName(state));
+  skmCycleLogAppend("Wake cause: %s", wakeCauseName(cause));
+  if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    skmCycleLogAppend("EXT1 wake mask: 0x%llX",
+                      static_cast<unsigned long long>(extMask));
+  }
+  skmCycleLogAppend("RTC state: %s", stateName(state));
 
   SensorSnapshot snapshot = readBaseSensorSnapshot();
 
@@ -726,6 +747,27 @@ void setup() {
   }
 
   Serial.printf("Decision: %s\n", plan.reason);
+  skmCycleLogAppend("Floats: LOW=%s HIGH=%s",
+                    contactState(snapshot.lowClosed),
+                    contactState(snapshot.highClosed));
+  if (snapshot.temperatureValid) {
+    skmCycleLogAppend("Water temperature: %.2f C",
+                      snapshot.waterTemperatureC);
+  } else if (temperatureReadRequested) {
+    skmCycleLogAppend("Water temperature: invalid");
+  } else {
+    skmCycleLogAppend("Water temperature: skipped for this wake");
+  }
+  if (snapshot.batteryValid) {
+    skmCycleLogAppend("MAX17048: %.3f V / raw SOC %.1f %% / rounded %u %% / INT %s",
+                      snapshot.batteryVoltage,
+                      snapshot.batterySocRaw,
+                      snapshot.batteryPercent,
+                      snapshot.maxIntLow ? "LOW" : "HIGH");
+  } else {
+    skmCycleLogAppend("MAX17048: unavailable");
+  }
+  skmCycleLogAppend("Decision: %s", plan.reason);
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
   if (plan.nextState == LevelState::NORMAL && !snapshot.lowClosed) {
@@ -799,9 +841,12 @@ void setup() {
       delay(SKIMMERSENSE_POST_REPORT_WAIT_MS);
       Serial.printf("Zigbee cycle survived. Reports queued: %s\n",
                     reportsOk ? "ALL OK" : "PARTIAL/FAILED");
+      skmCycleLogAppend("Zigbee cycle survived. Reports queued: %s",
+                        reportsOk ? "ALL OK" : "PARTIAL/FAILED");
     }
   } else {
     Serial.println("Zigbee cycle intentionally skipped for this state transition.");
+    skmCycleLogAppend("Zigbee cycle intentionally skipped");
   }
 
   enterPlannedSleep(plan);

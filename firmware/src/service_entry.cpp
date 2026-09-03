@@ -12,8 +12,9 @@
 #include "Zigbee.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
-// Keep the validated deep-sleep firmware source bit-for-bit unchanged.
-// It is compiled inside this translation unit under private entry-point names;
+// Keep the validated deep-sleep state-machine logic unchanged; the source now
+// also emits observational RTC log hooks for SERVICE diagnostics. It is compiled
+// inside this translation unit under private entry-point names;
 // the small wrapper below decides whether to run SERVICE mode or the normal
 // SkimmerSense setup/loop.
 #define setup skmNormalSetup

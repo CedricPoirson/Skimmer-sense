@@ -7,6 +7,7 @@
 #include <ESPmDNS.h>
 #include <esp_attr.h>
 #include <esp_system.h>
+#include <stdarg.h>
 
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
@@ -22,6 +23,9 @@ static constexpr uint32_t RESET_LOG_MAGIC = 0x534B4C31UL;  // "SKL1"
 static constexpr uint8_t RESET_LOG_CAPACITY = 8;
 static constexpr uint32_t HOME_WIFI_TIMEOUT_MS = 15000UL;
 static constexpr char MDNS_HOSTNAME[] = "skimmersense";
+static constexpr uint32_t CYCLE_LOG_MAGIC = 0x534B4331UL;  // "SKC1"
+static constexpr size_t CYCLE_LOG_CAPACITY = 3072;
+static constexpr size_t SERVICE_LOG_CAPACITY = 8192;
 
 struct RtcDiagnostics {
   uint32_t magic = 0;
@@ -65,7 +69,51 @@ struct PersistedResetLog {
   PersistedResetEvent events[RESET_LOG_CAPACITY];
 };
 
+struct RetainedCycleLog {
+  uint32_t magic;
+  uint16_t length;
+  uint8_t complete;
+  uint8_t truncated;
+  char text[CYCLE_LOG_CAPACITY];
+};
+
 RTC_DATA_ATTR RtcDiagnostics rtcDiagnostics;
+RTC_NOINIT_ATTR RetainedCycleLog retainedCycleLog;
+String serviceSessionLog;
+
+void appendServiceSessionLine(const String &line) {
+  String entry = line;
+  if (!entry.endsWith("\n")) entry += '\n';
+
+  if (entry.length() >= SERVICE_LOG_CAPACITY) {
+    entry = entry.substring(entry.length() - SERVICE_LOG_CAPACITY + 1);
+  }
+  const size_t required = serviceSessionLog.length() + entry.length();
+  if (required >= SERVICE_LOG_CAPACITY) {
+    serviceSessionLog.remove(0, required - SERVICE_LOG_CAPACITY + 1);
+  }
+  serviceSessionLog += entry;
+}
+
+String combinedLogText() {
+  String text;
+  text.reserve(CYCLE_LOG_CAPACITY + serviceSessionLog.length() + 256);
+  text += F("=== LAST RETAINED PRODUCTION CYCLE ===\n");
+  if (!skmCycleLogAvailable()) {
+    text += F("No retained production-cycle log. A power loss, USB flash or first boot may have cleared it.\n");
+  } else {
+    text += skmCycleLogIsComplete()
+              ? F("Status: complete (deep sleep reached)\n")
+              : F("Status: INCOMPLETE (cycle interrupted before deep sleep)\n");
+    text += skmCycleLogSnapshot();
+  }
+
+  text += F("\n=== CURRENT SERVICE SESSION ===\n");
+  text += serviceSessionLog.length()
+            ? serviceSessionLog
+            : String(F("No SERVICE event recorded yet.\n"));
+  return text;
+}
 
 const char *resetReasonName(esp_reset_reason_t reason) {
   switch (reason) {
@@ -242,6 +290,70 @@ String pageFooter() { return F("</body></html>"); }
 
 }  // namespace
 
+void skmCycleLogBegin() {
+  retainedCycleLog.magic = CYCLE_LOG_MAGIC;
+  retainedCycleLog.length = 0;
+  retainedCycleLog.complete = 0;
+  retainedCycleLog.truncated = 0;
+  retainedCycleLog.text[0] = '\0';
+}
+
+void skmCycleLogAppend(const char *format, ...) {
+  if (retainedCycleLog.magic != CYCLE_LOG_MAGIC) skmCycleLogBegin();
+
+  char line[384];
+  va_list args;
+  va_start(args, format);
+  const int formatted = vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  if (formatted < 0) return;
+
+  const size_t lineLength =
+      static_cast<size_t>(formatted) < sizeof(line)
+        ? static_cast<size_t>(formatted)
+        : sizeof(line) - 1;
+  const size_t available =
+      CYCLE_LOG_CAPACITY - 1 - retainedCycleLog.length;
+  if (available == 0) {
+    retainedCycleLog.truncated = 1;
+    return;
+  }
+
+  const size_t copyLength = lineLength < available ? lineLength : available;
+  memcpy(retainedCycleLog.text + retainedCycleLog.length, line, copyLength);
+  retainedCycleLog.length += static_cast<uint16_t>(copyLength);
+
+  if (copyLength < lineLength) {
+    retainedCycleLog.truncated = 1;
+  } else if (retainedCycleLog.length < CYCLE_LOG_CAPACITY - 1) {
+    retainedCycleLog.text[retainedCycleLog.length++] = '\n';
+  }
+  retainedCycleLog.text[retainedCycleLog.length] = '\0';
+}
+
+void skmCycleLogComplete() {
+  if (retainedCycleLog.magic == CYCLE_LOG_MAGIC) retainedCycleLog.complete = 1;
+}
+
+bool skmCycleLogAvailable() {
+  return retainedCycleLog.magic == CYCLE_LOG_MAGIC &&
+         retainedCycleLog.length > 0 &&
+         retainedCycleLog.length < CYCLE_LOG_CAPACITY;
+}
+
+bool skmCycleLogIsComplete() {
+  return skmCycleLogAvailable() && retainedCycleLog.complete != 0;
+}
+
+String skmCycleLogSnapshot() {
+  if (!skmCycleLogAvailable()) return String();
+  String text(retainedCycleLog.text);
+  if (retainedCycleLog.truncated) {
+    text += F("\n[production-cycle log truncated]\n");
+  }
+  return text;
+}
+
 bool skmServiceRequested() {
   pinMode(SKIMMERSENSE_SERVICE_PIN, INPUT_PULLUP);
   delay(5);
@@ -323,6 +435,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
                                     const char *firmwareFlavor,
                                     SkmServiceStatusProvider statusProvider) {
   skmDiagSetStage(SkmDiagStage::SERVICE);
+  serviceSessionLog = "";
 
   // XIAO ESP32-C6 RF switch: GPIO3 LOW enables switch control and GPIO14 LOW
   // selects the onboard ceramic antenna. SERVICE mode never starts Zigbee.
@@ -391,6 +504,21 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   Serial.println("Zigbee and deep sleep are disabled while SERVICE jumper is active.");
   Serial.println("==================================");
 
+  appendServiceSessionLine(String(F("SERVICE mode started")));
+  appendServiceSessionLine(String(F("Fallback AP: ")) + apSsid +
+                           (apOk ? F(" (started)") : F(" (FAILED)")));
+  if (staConnected) {
+    appendServiceSessionLine(String(F("Home Wi-Fi connected: ")) +
+                             homeSsid + F(" / ") + staIp.toString());
+    appendServiceSessionLine(String(F("mDNS: ")) +
+                             (mdnsOk ? F("skimmersense.local") : F("FAILED")));
+  } else if (homeConfigured) {
+    appendServiceSessionLine(String(F("Home Wi-Fi connection timeout: ")) +
+                             homeSsid);
+  } else {
+    appendServiceSessionLine(String(F("Home Wi-Fi not configured")));
+  }
+
   WebServer server(80);
   bool otaFinishedOk = false;
   String otaFailure;
@@ -401,6 +529,37 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
                       homeConfigured, homeSsid,
                       staConnected, staIp, mdnsOk);
   };
+
+  server.on("/logs.txt", HTTP_GET, [&]() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/plain; charset=utf-8", combinedLogText());
+  });
+
+  server.on("/logs-download", HTTP_GET, [&]() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Content-Disposition",
+                      "attachment; filename=skimmersense-logs.txt");
+    server.send(200, "text/plain; charset=utf-8", combinedLogText());
+  });
+
+  server.on("/logs", HTTP_GET, [&]() {
+    String html = makeHeader();
+    html += F("<h2>Wi-Fi logs</h2><div class='card'>"
+              "<p>The last production cycle is retained without flash writes. "
+              "This SERVICE session refreshes every two seconds.</p>"
+              "<p><a href='/'>Back to diagnostics</a> | "
+              "<a href='/logs-download'>Download logs</a></p>"
+              "<pre id='log' style='white-space:pre-wrap;overflow-wrap:anywhere;"
+              "background:#111;color:#d9f2d9;padding:12px;border-radius:8px;"
+              "min-height:280px'>Loading...</pre></div>"
+              "<script>async function r(){try{const x=await fetch('/logs.txt',"
+              "{cache:'no-store'});document.getElementById('log').textContent="
+              "await x.text();}catch(e){document.getElementById('log').textContent="
+              "='Log refresh failed: '+e;}}r();setInterval(r,2000);</script>");
+    html += pageFooter();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
+  });
 
   server.on("/", HTTP_GET, [&]() {
     String html = makeHeader();
@@ -413,6 +572,11 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
     }
     html += diagnosticsHtml();
     html += resetLogHtml();
+    html += F("<h2>Logs</h2><div class='card'><p>"
+              "<a href='/logs'>Open live Wi-Fi logs</a> | "
+              "<a href='/logs-download'>Download logs</a></p>"
+              "<p>Includes the retained last production cycle and the current "
+              "SERVICE session.</p></div>");
     html += F("<h2>OTA firmware update</h2><div class='card'><p>Upload a PlatformIO <code>firmware.bin</code>. The inactive OTA application slot is written; Zigbee storage is not intentionally erased.</p>");
     html += F("<p class='warn'><strong>After a successful upload:</strong> remove the D6-GND SERVICE jumper before rebooting if you want normal production mode.</p>");
     html += F("<form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required> <input type='submit' value='Upload firmware'></form></div>");
@@ -422,6 +586,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   });
 
   server.on("/reboot", HTTP_POST, [&]() {
+    appendServiceSessionLine(String(F("Software reboot requested from web page")));
     server.send(200, "text/html; charset=utf-8", "<html><body><h2>Rebooting...</h2></body></html>");
     delay(300);
     ESP.restart();
@@ -448,6 +613,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
           otaFinishedOk = false;
           otaFailure = "";
           Serial.printf("OTA start: %s\n", upload.filename.c_str());
+          appendServiceSessionLine(String(F("OTA start: ")) + upload.filename);
           if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
             otaFailure = "Unable to open the OTA application partition.";
             Update.printError(Serial);
@@ -464,6 +630,8 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
           if (!Update.hasError() && Update.end(true)) {
             otaFinishedOk = true;
             Serial.printf("OTA complete: %u bytes\n", static_cast<unsigned>(upload.totalSize));
+            appendServiceSessionLine(
+                String(F("OTA complete: ")) + String(upload.totalSize) + F(" bytes"));
           } else {
             if (!otaFailure.length()) otaFailure = "OTA finalization failed.";
             Update.printError(Serial);
@@ -471,6 +639,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
         } else if (upload.status == UPLOAD_FILE_ABORTED) {
           otaFailure = "Upload aborted by client.";
           Serial.println("OTA upload aborted");
+          appendServiceSessionLine(String(F("OTA upload aborted by client")));
         }
       });
 
@@ -481,6 +650,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
 
   server.begin();
   Serial.println("Service HTTP server started.");
+  appendServiceSessionLine(String(F("Service HTTP server started")));
 
   while (true) {
     server.handleClient();
