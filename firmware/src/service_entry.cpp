@@ -1,5 +1,17 @@
 #include "service_mode.h"
 
+// Pre-include every header used by sleep_main.cpp before the setup/loop rename
+// macros are defined. This keeps those macros from ever touching framework or
+// library declarations.
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
+#include "soc/soc_caps.h"
+#include "Zigbee.h"
+#include "zcl/esp_zigbee_zcl_power_config.h"
+
 // Keep the validated deep-sleep firmware source bit-for-bit unchanged.
 // It is compiled inside this translation unit under private entry-point names;
 // the small wrapper below decides whether to run SERVICE mode or the normal
@@ -59,7 +71,7 @@ String buildServiceHardwareHtml() {
 
   html += F("<tr><th>Adaptive NORMAL cache</th><td>");
   if (rtcNormalSleepValid) {
-    html += String(static_cast<unsigned long long>(rtcNormalSleepSeconds));
+    html += String(static_cast<unsigned long>(rtcNormalSleepSeconds));
     html += F(" s from ");
     html += String(rtcLastWaterTemperatureC, 2);
     html += F(" &deg;C");
