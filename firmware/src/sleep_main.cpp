@@ -674,14 +674,12 @@ CyclePlan makePlan(LevelState state,
                     wakeOk ? "armed as planned" : "PARTIAL/FAILED");
   const bool captureRequested = skmCycleCaptureRequested();
   if (captureRequested) {
-    skmCycleLogAppend("Persistent scenario capture: wake requested");
+    skmCycleLogAppend("Persistent fifty-wake capture: wake requested");
   }
   skmCycleLogComplete();
   if (captureRequested) {
-    const bool scenarioFinished = plan.nextState == LevelState::NORMAL;
-    const bool captureSaved =
-        skmPersistCycleLogIfRequested(scenarioFinished);
-    Serial.printf("Persistent scenario capture: %s | %u cycle(s) remaining\n",
+    const bool captureSaved = skmPersistCycleLogIfRequested();
+    Serial.printf("Persistent wake capture: %s | %u wake(s) remaining\n",
                   captureSaved ? "SAVED" : "FAILED",
                   static_cast<unsigned>(skmCycleCaptureRemaining()));
   }

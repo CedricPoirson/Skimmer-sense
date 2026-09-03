@@ -417,7 +417,7 @@ bool skmCycleCaptureRequested() {
   return skmCycleCaptureRemaining() > 0;
 }
 
-bool skmPersistCycleLogIfRequested(bool scenarioFinished) {
+bool skmPersistCycleLogIfRequested() {
   Preferences prefs;
   if (!prefs.begin("skm_diag", true)) return false;
   uint8_t remaining = prefs.getUChar(CAPTURE_REMAINING_KEY, 0);
@@ -467,15 +467,12 @@ bool skmPersistCycleLogIfRequested(bool scenarioFinished) {
     --remaining;
   }
 
-  const bool stop =
-      scenarioFinished || remaining == 0 || capacityReached || !saved;
+  const bool stop = remaining == 0 || capacityReached || !saved;
   if (saved && stop) {
     const char *stopMessage =
-        scenarioFinished
-          ? "[scenario capture stopped: state machine returned to NORMAL]\n"
-          : remaining == 0
-              ? "[scenario capture stopped: fifty-cycle limit reached]\n"
-              : "[scenario capture stopped: log capacity reached]\n";
+        remaining == 0
+          ? "[capture stopped: fifty-wake limit reached]\n"
+          : "[capture stopped: log capacity reached]\n";
     saved = file.print(stopMessage) == strlen(stopMessage);
   }
   file.flush();
@@ -709,7 +706,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   server.on("/capture-next", HTTP_POST, [&]() {
     const bool armed = skmRequestNextCycleCapture();
     appendServiceSessionLine(
-        armed ? String(F("Production scenario capture ARMED"))
+        armed ? String(F("Next 50 production wakes capture ARMED"))
               : String(F("FAILED to arm production scenario capture")));
     server.sendHeader("Location", "/", true);
     server.send(armed ? 303 : 500,
@@ -720,8 +717,8 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   server.on("/capture-cancel", HTTP_POST, [&]() {
     const bool cancelled = skmCancelCycleCapture();
     appendServiceSessionLine(
-        cancelled ? String(F("Scenario capture cancelled"))
-                  : String(F("Scenario capture was already inactive")));
+        cancelled ? String(F("Fifty-wake capture cancelled"))
+                  : String(F("Fifty-wake capture was already inactive")));
     server.sendHeader("Location", "/", true);
     server.send(303, "text/plain; charset=utf-8", "Capture cancelled");
   });
@@ -780,7 +777,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
       html += F("<p>Capture a complete multi-wake state-machine scenario across "
                 "RESET without continuous flash writes.</p>"
                 "<form method='POST' action='/capture-next'>"
-                "<button type='submit'>Capture next scenario</button></form>");
+                "<button type='submit'>Capture next 50 wakes</button></form>");
     }
     html += F("</div>");
     html += F("<h2>Logs</h2><div class='card'><p>"

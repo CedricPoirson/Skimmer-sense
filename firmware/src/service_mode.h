@@ -46,14 +46,13 @@ bool skmCycleLogAvailable();
 bool skmCycleLogIsComplete();
 String skmCycleLogSnapshot();
 
-// A capture request is stored in NVS by SERVICE mode. Successive production
-// cycles are appended until the state machine returns to NORMAL or the
-// fifty-cycle safety limit is reached.
+// A capture request is stored in NVS by SERVICE mode. The next 50 production
+// wakes are appended to persistent storage unless capture is cancelled.
 bool skmRequestNextCycleCapture();
 bool skmCancelCycleCapture();
 bool skmCycleCaptureRequested();
 uint8_t skmCycleCaptureRemaining();
-bool skmPersistCycleLogIfRequested(bool scenarioFinished);
+bool skmPersistCycleLogIfRequested();
 String skmPersistedCycleLogSnapshot();
 
 const char *skmDiagStageName(SkmDiagStage stage);

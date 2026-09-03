@@ -112,25 +112,25 @@ Normal timer/GPIO deep-sleep wakes do not write the reset history to flash, so o
 
 The production-cycle trace in RTC memory is flash-write-free. However, a
 hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
-state-machine test, use **Capture next scenario** on the SERVICE page. The
-firmware then appends successive production wakes to one NVS log. Capture stops
-automatically when the state machine reaches `NORMAL`, when the fifty-wake
-safety limit is reached, or when **Cancel capture** is pressed.
+long-running test, use **Capture next 50 wakes** on the SERVICE page. The
+firmware appends every production wake, including ordinary `NORMAL` wakes.
+Capture stops after 50 wakes or when **Cancel capture** is pressed.
 
-Recommended LOW-to-HIGH scenario workflow:
+Recommended 50-wake capture workflow:
 
-1. In SERVICE mode, click **Capture next scenario**.
+1. In SERVICE mode, click **Capture next 50 wakes**.
 2. Set the floats for the intended starting condition.
 3. Remove the SERVICE jumper and reboot into production mode.
 4. Leave the device in production across every required wake. For example,
    keep LOW closed for at least the five-minute `LOW_PENDING` confirmation;
    do not re-enter SERVICE after the first deep sleep.
-5. Complete the scenario by opening HIGH so the state returns to `NORMAL`.
-6. Refit the SERVICE jumper, press RESET, then open `/logs` or download
-   `/logs-download`. The trace is listed chronologically as
-   `Production wake #1`, `#2`, and so on.
+5. Continue the test for as many wakes as needed. Returning to `NORMAL` does
+   not stop the capture.
+6. To inspect before all 50 wakes are complete, re-enter SERVICE mode and press
+   **Cancel capture**. Then open `/logs` or download `/logs-download`. The
+   trace is listed chronologically as `Production wake #1`, `#2`, and so on.
 
-The full multi-wake trace is appended to the dedicated SPIFFS partition, while
+The full fifty-wake trace is appended to the dedicated SPIFFS partition, while
 NVS stores only the small remaining-wake counter. Up to 50 complete wakes can
 be retained, with a 192 KiB log-size safety limit. Each captured wake causes one
 deliberate flash append, but only while this manual capture is armed. Normal
