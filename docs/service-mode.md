@@ -20,11 +20,11 @@ GPIO16 is not one of the ESP32-C6 RTC GPIOs (RTC/EXT1 wake is limited to GPIO0..
 
 ## Wi-Fi architecture
 
-SERVICE mode uses **AP + STA simultaneously**:
+SERVICE mode uses **AP + STA simultaneously** when private home Wi-Fi credentials are present:
 
 - the SkimmerSense always starts a private fallback access point;
-- if home Wi-Fi credentials are present at build time, it also tries to join that network;
-- when the home connection succeeds, the page is available through the LAN IP and through mDNS;
+- if home Wi-Fi credentials are present at build time, it also tries to join that network for up to 12 seconds;
+- when the home connection succeeds, the HTTP diagnostics/OTA server is reachable from the LAN and through mDNS;
 - if the home Wi-Fi is unavailable, the fallback AP remains usable.
 
 The fallback AP is always:
@@ -35,19 +35,13 @@ Password: SKM-XXXXXX
 Address:  http://192.168.4.1/
 ```
 
-When the home connection succeeds, the serial log and the service page show the DHCP address, for example:
-
-```text
-http://192.168.100.123/
-```
-
-mDNS is also started as:
+When the home connection succeeds, SERVICE mode prints its DHCP address on the serial console and starts mDNS as:
 
 ```text
 http://skimmersense.local/
 ```
 
-If `.local` name resolution is unavailable on a client, use the LAN IP shown on the page or serial console.
+Normally there is therefore no need to know the DHCP address. If `.local` name resolution is unavailable on a client, obtain the SkimmerSense address from the router/DHCP table or use the fallback AP at `192.168.4.1`.
 
 The ESP32-C6 Wi-Fi radio is 2.4 GHz. The configured SSID therefore needs a 2.4 GHz network (or a combined SSID that accepts 2.4 GHz clients).
 
@@ -83,13 +77,13 @@ The real file is listed in `.gitignore`:
 firmware/include/wifi_secrets.h
 ```
 
-If that file is absent, the firmware still builds and SERVICE mode simply uses the private fallback AP only. This is also how GitHub Actions can build the project without having access to private Wi-Fi credentials.
+If that file is absent, the firmware still builds and SERVICE mode simply uses the private fallback AP only. This is also how GitHub Actions builds the project without access to private Wi-Fi credentials.
 
 ## Connecting without USB
 
 1. Fit the D6-GND SERVICE jumper.
 2. Press RESET or power-cycle the XIAO.
-3. If the configured home Wi-Fi is reachable, open `http://skimmersense.local/` or the LAN IP shown by DHCP.
+3. If the configured home Wi-Fi is reachable, open `http://skimmersense.local/`.
 4. Otherwise connect a phone/laptop to `SkimmerSense-XXXXXX` and open `http://192.168.4.1/`.
 
 The home Wi-Fi password is never displayed by the service page. The fallback AP password is derived locally from the device suffix and is displayed because it is intentionally the recovery path.
@@ -99,7 +93,6 @@ The home Wi-Fi password is never displayed by the service page. The fallback AP 
 The service page currently shows:
 
 - firmware version/flavor;
-- home Wi-Fi connection state and LAN address;
 - fallback AP information;
 - retained pool-level state;
 - current LOW and HIGH float states;
