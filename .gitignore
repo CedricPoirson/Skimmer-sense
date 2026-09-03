@@ -49,6 +49,9 @@ build-*/
 firmware/.pio/
 firmware/.vscode/
 
+# Local secrets
+firmware/include/wifi_secrets.h
+
 # macOS
 .DS_Store
 **/.DS_Store
