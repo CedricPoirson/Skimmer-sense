@@ -18,40 +18,89 @@ Maintenance operation: **jumper closed**, then press RESET or power-cycle the XI
 
 GPIO16 is not one of the ESP32-C6 RTC GPIOs (RTC/EXT1 wake is limited to GPIO0..GPIO7), so closing this jumper while the XIAO is already in deep sleep does **not** wake it. A reset/power-cycle is required after fitting the jumper.
 
+## Wi-Fi architecture
+
+SERVICE mode uses **AP + STA simultaneously**:
+
+- the SkimmerSense always starts a private fallback access point;
+- if home Wi-Fi credentials are present at build time, it also tries to join that network;
+- when the home connection succeeds, the page is available through the LAN IP and through mDNS;
+- if the home Wi-Fi is unavailable, the fallback AP remains usable.
+
+The fallback AP is always:
+
+```text
+SSID:     SkimmerSense-XXXXXX
+Password: SKM-XXXXXX
+Address:  http://192.168.4.1/
+```
+
+When the home connection succeeds, the serial log and the service page show the DHCP address, for example:
+
+```text
+http://192.168.100.123/
+```
+
+mDNS is also started as:
+
+```text
+http://skimmersense.local/
+```
+
+If `.local` name resolution is unavailable on a client, use the LAN IP shown on the page or serial console.
+
+The ESP32-C6 Wi-Fi radio is 2.4 GHz. The configured SSID therefore needs a 2.4 GHz network (or a combined SSID that accepts 2.4 GHz clients).
+
+## Home Wi-Fi credentials
+
+Credentials must **not** be committed to GitHub.
+
+A safe template is tracked in the repository:
+
+```text
+firmware/include/wifi_secrets.example.h
+```
+
+Create the local file:
+
+```bash
+cd firmware/include
+cp wifi_secrets.example.h wifi_secrets.h
+```
+
+Then edit `wifi_secrets.h`:
+
+```cpp
+#pragma once
+
+#define SKIMMERSENSE_WIFI_SSID "Your-2.4GHz-WiFi"
+#define SKIMMERSENSE_WIFI_PASSWORD "Your-WiFi-Password"
+```
+
+The real file is listed in `.gitignore`:
+
+```text
+firmware/include/wifi_secrets.h
+```
+
+If that file is absent, the firmware still builds and SERVICE mode simply uses the private fallback AP only. This is also how GitHub Actions can build the project without having access to private Wi-Fi credentials.
+
 ## Connecting without USB
 
-With the jumper closed at boot, SkimmerSense creates its own Wi-Fi access point. No home Wi-Fi credentials are stored or required.
+1. Fit the D6-GND SERVICE jumper.
+2. Press RESET or power-cycle the XIAO.
+3. If the configured home Wi-Fi is reachable, open `http://skimmersense.local/` or the LAN IP shown by DHCP.
+4. Otherwise connect a phone/laptop to `SkimmerSense-XXXXXX` and open `http://192.168.4.1/`.
 
-The SSID is:
-
-```text
-SkimmerSense-XXXXXX
-```
-
-The password is derived directly from the same six-character suffix:
-
-```text
-SKM-XXXXXX
-```
-
-Example:
-
-```text
-SSID:     SkimmerSense-A1B2C3
-Password: SKM-A1B2C3
-```
-
-Connect a phone or laptop to that access point, then open:
-
-```text
-http://192.168.4.1/
-```
+The home Wi-Fi password is never displayed by the service page. The fallback AP password is derived locally from the device suffix and is displayed because it is intentionally the recovery path.
 
 ## Information available
 
 The service page currently shows:
 
 - firmware version/flavor;
+- home Wi-Fi connection state and LAN address;
+- fallback AP information;
 - retained pool-level state;
 - current LOW and HIGH float states;
 - current DS18B20 water temperature;
@@ -63,8 +112,6 @@ The service page currently shows:
 - the eight most recent **non-deep-sleep resets** stored in NVS.
 
 Normal timer/GPIO deep-sleep wakes do not write the reset history to flash, so ordinary operation does not create continuous NVS wear. Power-on, manual/software reset, panic, watchdog and brownout resets are retained for later inspection.
-
-The first implementation mainly identifies the class of reset. More detailed execution-stage breadcrumbs can be added after the SERVICE/OTA path is hardware-validated.
 
 ## OTA update
 
@@ -95,4 +142,4 @@ Do not use `pio run -t erase` as part of normal updating, because that would era
 
 ## Battery note
 
-SERVICE mode keeps the ESP32-C6 awake with Wi-Fi enabled. Its consumption is therefore much higher than normal deep-sleep operation. It is intended for short maintenance sessions, not unattended battery operation.
+SERVICE mode keeps the ESP32-C6 awake with Wi-Fi enabled. AP+STA and the web server consume far more power than normal deep sleep. SERVICE mode is intended for short maintenance sessions only.
