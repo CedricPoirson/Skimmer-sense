@@ -115,9 +115,26 @@ Normal timer/GPIO deep-sleep wakes do not write the reset history to flash, so o
 
 ## OTA update
 
-The existing `zigbee.csv` partition layout contains `otadata`, `ota_0` and `ota_1`, so the service page can upload a normal PlatformIO firmware binary to the inactive application slot.
+SERVICE mode uses the repository partition table `firmware/skimmersense_zigbee_ota.csv`. It keeps the standard Arduino Zigbee persistent-storage addresses (`zb_storage`, `zb_fct` and `coredump`) unchanged, but enlarges both OTA application slots to `0x170000` bytes each. The SPIFFS area is reduced and is not used by SkimmerSense.
 
-Build the production image with:
+This custom layout is required because adding Wi-Fi, WebServer, mDNS and OTA support makes the combined Zigbee + SERVICE firmware larger than the standard Arduino `zigbee.csv` OTA slot.
+
+### First installation of SERVICE mode
+
+The partition table itself cannot be replaced by a normal application OTA. Therefore the first SERVICE-capable firmware installation must be flashed once over USB so PlatformIO also writes the new partition table. This operation is designed to keep the Zigbee storage partitions at the same flash addresses; nevertheless the first hardware test must verify that the existing Zigbee pairing survives before relying on OTA in production.
+
+Do **not** erase the flash.
+
+Build and upload the production image with:
+
+```bash
+cd firmware
+pio run -e seeed_xiao_esp32c6_sleep_zigbee_production -t upload
+```
+
+After that first USB installation, future application updates can use the SERVICE web page.
+
+Build the OTA image with:
 
 ```bash
 cd firmware
@@ -130,7 +147,7 @@ The file to select in the SERVICE web page is:
 .pio/build/seeed_xiao_esp32c6_sleep_zigbee_production/firmware.bin
 ```
 
-The OTA update writes the application slot only. It does **not** intentionally erase the separate Zigbee storage partitions, so the normal OTA path is designed to preserve Zigbee pairing.
+The OTA update writes the inactive application slot only. It does **not** intentionally erase the separate Zigbee storage partitions, so the normal OTA path is designed to preserve Zigbee pairing.
 
 After the page reports a successful upload:
 
