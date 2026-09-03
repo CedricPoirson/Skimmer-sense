@@ -83,6 +83,10 @@ struct RetainedCycleLog {
   char text[CYCLE_LOG_CAPACITY];
 };
 
+RTC_DATA_ATTR RtcDiagnostics rtcDiagnostics;
+RTC_NOINIT_ATTR RetainedCycleLog retainedCycleLog;
+String serviceSessionLog;
+
 void appendServiceSessionLine(const String &line) {
   String entry = line;
   if (!entry.endsWith("\n")) entry += '\n';
