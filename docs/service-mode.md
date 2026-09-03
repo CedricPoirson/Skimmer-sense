@@ -110,6 +110,12 @@ The service page currently shows:
 
 Normal timer/GPIO deep-sleep wakes do not write the reset history to flash, so ordinary operation does not create continuous NVS wear. Power-on, manual/software reset, panic, watchdog and brownout resets are retained for later inspection.
 
+On every cold production boot, Zigbee is now started so the device announces
+itself and publishes a fresh temperature. If LOW is closed, LOW/HIGH reporting
+is deliberately withheld until the five-minute anti-wave confirmation
+completes; this prevents Home Assistant from treating an unconfirmed startup
+contact as a refill request.
+
 The production-cycle trace in RTC memory is flash-write-free. However, a
 hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
 long-running test, use **Capture next 50 wakes** on the SERVICE page. The

@@ -591,6 +591,17 @@ CyclePlan makePlan(LevelState state,
       break;
   }
 
+  // Always announce a cold production boot. When LOW still needs the
+  // anti-wave confirmation, publish temperature only: reporting raw floats
+  // here could look like a validated refill request to Home Assistant.
+  if (coldBoot && !plan.useZigbee) {
+    plan.useZigbee = true;
+    plan.reportTemperature = true;
+    plan.reportFloats = false;
+    plan.reason =
+        "LOW closed -> confirmation; cold-boot Zigbee heartbeat (temperature only)";
+  }
+
   // Adaptive periodic NORMAL refresh is used only when the LOW
   // float is OPEN. Fault states and LOW-confirmation logic keep their
   // conservative fixed timers. GPIO wake remains immediate.
