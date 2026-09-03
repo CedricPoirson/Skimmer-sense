@@ -99,6 +99,95 @@ static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
 static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
 static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
 
+struct ZigbeeReportConfirmation {
+  volatile bool expected = false;
+  volatile bool received = false;
+  volatile esp_err_t status = ESP_FAIL;
+  volatile uint8_t tsn = 0;
+};
+
+ZigbeeReportConfirmation zbReportConfirmations[3];
+
+int reportConfirmationIndex(uint8_t endpoint) {
+  if (endpoint == ZB_EP_TEMPERATURE) return 0;
+  if (endpoint == ZB_EP_LOW_LEVEL) return 1;
+  if (endpoint == ZB_EP_HIGH_LEVEL) return 2;
+  return -1;
+}
+
+const char *reportConfirmationLabel(size_t index) {
+  static constexpr const char *LABELS[] = {
+      "temperature", "low-float", "high-float"};
+  return index < 3 ? LABELS[index] : "unknown";
+}
+
+void zigbeeCommandSendStatusCallback(
+    esp_zb_zcl_command_send_status_message_t message) {
+  const int index = reportConfirmationIndex(message.src_endpoint);
+  if (index < 0) return;
+
+  zbReportConfirmations[index].status = message.status;
+  zbReportConfirmations[index].tsn = message.tsn;
+  zbReportConfirmations[index].received = true;
+}
+
+void resetZigbeeReportConfirmations() {
+  for (auto &confirmation : zbReportConfirmations) {
+    confirmation.expected = false;
+    confirmation.received = false;
+    confirmation.status = ESP_FAIL;
+    confirmation.tsn = 0;
+  }
+}
+
+void expectZigbeeReportConfirmation(uint8_t endpoint) {
+  const int index = reportConfirmationIndex(endpoint);
+  if (index < 0) return;
+  zbReportConfirmations[index].expected = true;
+  zbReportConfirmations[index].received = false;
+  zbReportConfirmations[index].status = ESP_FAIL;
+  zbReportConfirmations[index].tsn = 0;
+}
+
+bool logZigbeeReportConfirmations() {
+  bool allConfirmed = true;
+  bool anyExpected = false;
+
+  for (size_t index = 0; index < 3; ++index) {
+    const ZigbeeReportConfirmation &confirmation =
+        zbReportConfirmations[index];
+    if (!confirmation.expected) continue;
+    anyExpected = true;
+
+    if (!confirmation.received) {
+      allConfirmed = false;
+      Serial.printf("Report %-12s: delivery confirmation NOT RECEIVED\n",
+                    reportConfirmationLabel(index));
+      skmCycleLogAppend("Report %s: delivery confirmation NOT RECEIVED",
+                        reportConfirmationLabel(index));
+      continue;
+    }
+
+    const esp_err_t status = confirmation.status;
+    const bool ok = status == ESP_OK;
+    allConfirmed &= ok;
+    Serial.printf("Report %-12s: delivery %s / TSN %u / 0x%x (%s)\n",
+                  reportConfirmationLabel(index),
+                  ok ? "CONFIRMED" : "FAILED",
+                  static_cast<unsigned>(confirmation.tsn),
+                  status,
+                  esp_err_to_name(status));
+    skmCycleLogAppend("Report %s: delivery %s / TSN %u / 0x%x (%s)",
+                      reportConfirmationLabel(index),
+                      ok ? "CONFIRMED" : "FAILED",
+                      static_cast<unsigned>(confirmation.tsn),
+                      status,
+                      esp_err_to_name(status));
+  }
+
+  return anyExpected && allConfirmed;
+}
+
 static constexpr uint32_t RTC_MAGIC = 0x534B4D31UL;  // "SKM1"
 
 enum class LevelState : uint8_t {
@@ -425,7 +514,7 @@ void configureZigbeeTxPower() {
                         : " (stack value retained)");
 }
 
-bool logZigbeeParentReception() {
+bool logZigbeeParentReception(const char *phase) {
   esp_zb_nwk_info_iterator_t iterator = ESP_ZB_NWK_INFO_ITERATOR_INIT;
   esp_zb_nwk_neighbor_info_t neighbor{};
   bool found = false;
@@ -434,8 +523,8 @@ bool logZigbeeParentReception() {
   uint16_t parentShortAddress = 0xFFFF;
 
   if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
-    Serial.println("Zigbee parent RX: unavailable (stack lock)");
-    skmCycleLogAppend("Zigbee parent RX: unavailable (stack lock)");
+    Serial.printf("Zigbee parent RX (%s): unavailable (stack lock)\n", phase);
+    skmCycleLogAppend("Zigbee parent RX (%s): unavailable (stack lock)", phase);
     return false;
   }
 
@@ -451,16 +540,18 @@ bool logZigbeeParentReception() {
   esp_zb_lock_release();
 
   if (!found) {
-    Serial.println("Zigbee parent RX: unavailable on this wake");
-    skmCycleLogAppend("Zigbee parent RX: unavailable on this wake");
+    Serial.printf("Zigbee parent RX (%s): unavailable on this wake\n", phase);
+    skmCycleLogAppend("Zigbee parent RX (%s): unavailable on this wake", phase);
     return false;
   }
 
-  Serial.printf("Zigbee parent RX: RSSI %d dBm / LQI %u / short 0x%04X\n",
+  Serial.printf("Zigbee parent RX (%s): RSSI %d dBm / LQI %u / short 0x%04X\n",
+                phase,
                 static_cast<int>(parentRssiDbm),
                 static_cast<unsigned>(parentLqi),
                 static_cast<unsigned>(parentShortAddress));
-  skmCycleLogAppend("Zigbee parent RX: RSSI %d dBm / LQI %u / short 0x%04X",
+  skmCycleLogAppend("Zigbee parent RX (%s): RSSI %d dBm / LQI %u / short 0x%04X",
+                    phase,
                     static_cast<int>(parentRssiDbm),
                     static_cast<unsigned>(parentLqi),
                     static_cast<unsigned>(parentShortAddress));
@@ -541,8 +632,15 @@ bool startZigbee() {
     return false;
   }
 
-  Serial.println("Zigbee connected!");
-  skmCycleLogAppend("Zigbee: connected");
+  const uint32_t reconnectElapsed = millis() - startedAt;
+  Serial.printf("Zigbee connected in %lu ms after stack start!\n",
+                static_cast<unsigned long>(reconnectElapsed));
+  skmCycleLogAppend("Zigbee: connected in %lu ms after stack start",
+                    static_cast<unsigned long>(reconnectElapsed));
+
+  resetZigbeeReportConfirmations();
+  esp_zb_zcl_command_send_status_handler_register(
+      zigbeeCommandSendStatusCallback);
   return true;
 }
 
@@ -557,6 +655,7 @@ bool sendSafeReport(uint8_t endpoint, uint16_t clusterId, uint16_t attributeId, 
   report.dis_default_resp = 0x00U;
 
   Serial.printf("Report %-12s: queue...\n", label);
+  expectZigbeeReportConfirmation(endpoint);
   if (!esp_zb_lock_acquire(portMAX_DELAY)) {
     Serial.printf("Report %-12s: Zigbee lock FAILED\n", label);
     skmCycleLogAppend("Report %s: Zigbee lock FAILED", label);
@@ -969,7 +1068,7 @@ void setup() {
 
       // Read the parent entry already learned by the stack. This is a local
       // diagnostic lookup and does not transmit an extra Zigbee frame.
-      logZigbeeParentReception();
+      logZigbeeParentReception("before reports");
 
       bool reportsOk = true;
       if (plan.reportTemperature && snapshot.temperatureValid) {
@@ -1002,15 +1101,26 @@ void setup() {
         Serial.println("Report battery     : SKIPPED - ZBOSS bug");
       }
 
-      Serial.printf("Post-report wait: %lu ms...\n",
+      Serial.printf("Post-report confirmation wait: %lu ms...\n",
                     static_cast<unsigned long>(SKIMMERSENSE_POST_REPORT_WAIT_MS));
       delay(SKIMMERSENSE_POST_REPORT_WAIT_MS);
-      Serial.printf("Zigbee cycle survived. Reports queued: %s\n",
-                    reportsOk ? "ALL OK" : "PARTIAL/FAILED");
-      skmCycleLogAppend("Zigbee cycle survived. Reports queued: %s",
-                        reportsOk ? "ALL OK" : "PARTIAL/FAILED");
-      if (!reportsOk) {
-        scheduleZigbeeRecovery(plan, "report failure");
+
+      const bool deliveriesConfirmed = logZigbeeReportConfirmations();
+      logZigbeeParentReception("after reports");
+
+      Serial.printf(
+          "Zigbee cycle survived. Queueing: %s / delivery confirmations: %s\n",
+          reportsOk ? "ALL OK" : "PARTIAL/FAILED",
+          deliveriesConfirmed ? "ALL CONFIRMED" : "PARTIAL/MISSING");
+      skmCycleLogAppend(
+          "Zigbee cycle survived. Queueing: %s / delivery confirmations: %s",
+          reportsOk ? "ALL OK" : "PARTIAL/FAILED",
+          deliveriesConfirmed ? "ALL CONFIRMED" : "PARTIAL/MISSING");
+      if (!reportsOk || !deliveriesConfirmed) {
+        scheduleZigbeeRecovery(
+            plan,
+            reportsOk ? "missing/failed delivery confirmation"
+                      : "report queueing failure");
       }
     }
   } else {
