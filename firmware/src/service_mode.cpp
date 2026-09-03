@@ -8,6 +8,7 @@
 #include <esp_attr.h>
 #include <esp_system.h>
 #include <stdarg.h>
+#include <stddef.h>
 
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
@@ -26,8 +27,10 @@ static constexpr char MDNS_HOSTNAME[] = "skimmersense";
 static constexpr uint32_t CYCLE_LOG_MAGIC = 0x534B4331UL;  // "SKC1"
 static constexpr size_t CYCLE_LOG_CAPACITY = 3072;
 static constexpr size_t SERVICE_LOG_CAPACITY = 8192;
-static constexpr char CAPTURE_REQUEST_KEY[] = "capnext";
-static constexpr char CAPTURE_LOG_KEY[] = "cyclelog";
+static constexpr uint8_t SCENARIO_MAX_CYCLES = 8;
+static constexpr size_t SCENARIO_LOG_CAPACITY = 8192;
+static constexpr char CAPTURE_REMAINING_KEY[] = "capremain";
+static constexpr char SCENARIO_LOG_KEY[] = "scenlog";
 
 struct RtcDiagnostics {
   uint32_t magic = 0;
@@ -79,22 +82,59 @@ struct RetainedCycleLog {
   char text[CYCLE_LOG_CAPACITY];
 };
 
+static constexpr uint32_t SCENARIO_LOG_MAGIC = 0x534B5331UL;  // "SKS1"
+struct PersistedScenarioLog {
+  uint32_t magic;
+  uint16_t length;
+  uint8_t cycleCount;
+  uint8_t truncated;
+  char text[SCENARIO_LOG_CAPACITY];
+};
+
 RTC_DATA_ATTR RtcDiagnostics rtcDiagnostics;
 RTC_NOINIT_ATTR RetainedCycleLog retainedCycleLog;
+PersistedScenarioLog scenarioLogWork;
 String serviceSessionLog;
 
-bool loadPersistedCycleLog(RetainedCycleLog &log) {
+bool loadPersistedScenarioLog() {
   Preferences prefs;
   if (!prefs.begin("skm_diag", true)) return false;
-  const size_t storedSize = prefs.getBytesLength(CAPTURE_LOG_KEY);
+  const size_t headerSize = offsetof(PersistedScenarioLog, text);
+  const size_t storedSize = prefs.getBytesLength(SCENARIO_LOG_KEY);
+  scenarioLogWork = {};
+  const bool sizeOk =
+      storedSize > headerSize && storedSize <= sizeof(PersistedScenarioLog);
+  const bool readOk =
+      sizeOk &&
+      prefs.getBytes(SCENARIO_LOG_KEY,
+                     &scenarioLogWork,
+                     storedSize) == storedSize;
   const bool ok =
-      storedSize == sizeof(RetainedCycleLog) &&
-      prefs.getBytes(CAPTURE_LOG_KEY, &log, sizeof(log)) == sizeof(log) &&
-      log.magic == CYCLE_LOG_MAGIC &&
-      log.length > 0 &&
-      log.length < CYCLE_LOG_CAPACITY;
+      readOk &&
+      scenarioLogWork.magic == SCENARIO_LOG_MAGIC &&
+      scenarioLogWork.length > 0 &&
+      scenarioLogWork.length < SCENARIO_LOG_CAPACITY &&
+      storedSize == headerSize + scenarioLogWork.length + 1 &&
+      scenarioLogWork.text[scenarioLogWork.length] == '\0';
   prefs.end();
   return ok;
+}
+
+void resetScenarioLog() {
+  scenarioLogWork = {};
+  scenarioLogWork.magic = SCENARIO_LOG_MAGIC;
+}
+
+void appendScenarioBytes(const char *data, size_t length) {
+  const size_t available =
+      SCENARIO_LOG_CAPACITY - 1 - scenarioLogWork.length;
+  const size_t copyLength = length < available ? length : available;
+  if (copyLength > 0) {
+    memcpy(scenarioLogWork.text + scenarioLogWork.length, data, copyLength);
+    scenarioLogWork.length += static_cast<uint16_t>(copyLength);
+    scenarioLogWork.text[scenarioLogWork.length] = '\0';
+  }
+  if (copyLength < length) scenarioLogWork.truncated = 1;
 }
 
 void appendServiceSessionLine(const String &line) {
@@ -124,14 +164,20 @@ String combinedLogText() {
     text += skmCycleLogSnapshot();
   }
 
-  text += F("\n=== LAST PERSISTED ON-DEMAND CAPTURE ===\n");
+  text += F("\n=== LAST PERSISTED SCENARIO CAPTURE ===\n");
   const String persisted = skmPersistedCycleLogSnapshot();
   text += persisted.length()
             ? persisted
-            : String(F("No on-demand production capture has been saved yet.\n"));
+            : String(F("No persistent production scenario has been saved yet.\n"));
 
-  text += F("\nCapture next production cycle: ");
-  text += skmCycleCaptureRequested() ? F("ARMED\n") : F("not armed\n");
+  text += F("\nScenario capture: ");
+  if (skmCycleCaptureRequested()) {
+    text += F("ARMED / ");
+    text += String(skmCycleCaptureRemaining());
+    text += F(" cycle(s) remaining\n");
+  } else {
+    text += F("not armed\n");
+  }
 
   text += F("\n=== CURRENT SERVICE SESSION ===\n");
   text += serviceSessionLog.length()
@@ -382,55 +428,129 @@ String skmCycleLogSnapshot() {
 bool skmRequestNextCycleCapture() {
   Preferences prefs;
   if (!prefs.begin("skm_diag", false)) return false;
-  const bool ok = prefs.putBool(CAPTURE_REQUEST_KEY, true) > 0;
+  prefs.remove("capnext");  // Remove the obsolete one-cycle request, if present.
+  prefs.remove("cyclelog");
+  prefs.remove(SCENARIO_LOG_KEY);
+  const bool ok =
+      prefs.putUChar(CAPTURE_REMAINING_KEY, SCENARIO_MAX_CYCLES) > 0;
   prefs.end();
   return ok;
 }
 
-bool skmCycleCaptureRequested() {
-  Preferences prefs;
-  if (!prefs.begin("skm_diag", true)) return false;
-  const bool requested = prefs.getBool(CAPTURE_REQUEST_KEY, false);
-  prefs.end();
-  return requested;
-}
-
-bool skmPersistCycleLogIfRequested() {
+bool skmCancelCycleCapture() {
   Preferences prefs;
   if (!prefs.begin("skm_diag", false)) return false;
-  if (!prefs.getBool(CAPTURE_REQUEST_KEY, false)) {
+  const bool existed = prefs.isKey(CAPTURE_REMAINING_KEY);
+  prefs.remove(CAPTURE_REMAINING_KEY);
+  prefs.end();
+  return existed;
+}
+
+uint8_t skmCycleCaptureRemaining() {
+  Preferences prefs;
+  if (!prefs.begin("skm_diag", true)) return 0;
+  const uint8_t remaining =
+      prefs.getUChar(CAPTURE_REMAINING_KEY, 0);
+  prefs.end();
+  return remaining;
+}
+
+bool skmCycleCaptureRequested() {
+  return skmCycleCaptureRemaining() > 0;
+}
+
+bool skmPersistCycleLogIfRequested(bool scenarioFinished) {
+  Preferences prefs;
+  if (!prefs.begin("skm_diag", false)) return false;
+  uint8_t remaining = prefs.getUChar(CAPTURE_REMAINING_KEY, 0);
+  if (remaining == 0) {
     prefs.end();
     return false;
   }
 
-  const bool valid =
-      retainedCycleLog.magic == CYCLE_LOG_MAGIC &&
-      retainedCycleLog.length > 0 &&
-      retainedCycleLog.length < CYCLE_LOG_CAPACITY;
+  const size_t headerSize = offsetof(PersistedScenarioLog, text);
+  const size_t storedSize = prefs.getBytesLength(SCENARIO_LOG_KEY);
+  scenarioLogWork = {};
+  const bool sizeOk =
+      storedSize > headerSize && storedSize <= sizeof(PersistedScenarioLog);
+  const bool readOk =
+      sizeOk &&
+      prefs.getBytes(SCENARIO_LOG_KEY,
+                     &scenarioLogWork,
+                     storedSize) == storedSize;
+  const bool loaded =
+      readOk &&
+      scenarioLogWork.magic == SCENARIO_LOG_MAGIC &&
+      scenarioLogWork.length < SCENARIO_LOG_CAPACITY &&
+      storedSize == headerSize + scenarioLogWork.length + 1 &&
+      scenarioLogWork.text[scenarioLogWork.length] == '\0';
+  if (!loaded) resetScenarioLog();
+
+  char header[64];
+  const int headerLength = snprintf(
+      header, sizeof(header),
+      "\n--- Production wake #%u ---\n",
+      static_cast<unsigned>(scenarioLogWork.cycleCount + 1));
+  if (headerLength > 0) {
+    appendScenarioBytes(
+        header,
+        static_cast<size_t>(headerLength) < sizeof(header)
+          ? static_cast<size_t>(headerLength)
+          : sizeof(header) - 1);
+  }
+  appendScenarioBytes(retainedCycleLog.text, retainedCycleLog.length);
+  if (retainedCycleLog.length == 0 ||
+      retainedCycleLog.text[retainedCycleLog.length - 1] != '\n') {
+    appendScenarioBytes("\n", 1);
+  }
+
+  ++scenarioLogWork.cycleCount;
+  if (remaining > 0) --remaining;
+  const bool stop =
+      scenarioFinished ||
+      remaining == 0 ||
+      scenarioLogWork.truncated != 0;
+  if (stop) {
+    const char *stopMessage =
+        scenarioFinished
+          ? "[scenario capture stopped: state machine returned to NORMAL]\n"
+          : remaining == 0
+              ? "[scenario capture stopped: eight-cycle limit reached]\n"
+              : "[scenario capture stopped: log capacity reached]\n";
+    appendScenarioBytes(stopMessage, strlen(stopMessage));
+  }
+
+  // Store only the populated prefix instead of rewriting the full 8 KiB
+  // capacity on every wake. This keeps multi-wake NVS updates reliable.
+  const size_t blobSize =
+      offsetof(PersistedScenarioLog, text) +
+      scenarioLogWork.length + 1;
   const bool saved =
-      valid &&
-      prefs.putBytes(CAPTURE_LOG_KEY,
-                     &retainedCycleLog,
-                     sizeof(retainedCycleLog)) == sizeof(retainedCycleLog);
-  if (saved) prefs.remove(CAPTURE_REQUEST_KEY);
+      prefs.putBytes(SCENARIO_LOG_KEY,
+                     &scenarioLogWork,
+                     blobSize) == blobSize;
+  if (saved) {
+    if (stop) prefs.remove(CAPTURE_REMAINING_KEY);
+    else prefs.putUChar(CAPTURE_REMAINING_KEY, remaining);
+  }
   prefs.end();
   return saved;
 }
 
 String skmPersistedCycleLogSnapshot() {
-  RetainedCycleLog log{};
-  if (!loadPersistedCycleLog(log)) return String();
+  if (!loadPersistedScenarioLog()) return String();
 
   String text;
-  text.reserve(log.length + 80);
-  text += log.complete
-            ? F("Status: complete (deep sleep reached)\n")
-            : F("Status: INCOMPLETE\n");
-  text += log.text;
-  if (log.truncated) text += F("\n[persisted log truncated]\n");
+  text.reserve(scenarioLogWork.length + 96);
+  text += F("Captured production wakes: ");
+  text += String(scenarioLogWork.cycleCount);
+  text += F("\n");
+  text += scenarioLogWork.text;
+  if (scenarioLogWork.truncated) {
+    text += F("\n[persisted scenario log truncated]\n");
+  }
   return text;
 }
-
 bool skmServiceRequested() {
   pinMode(SKIMMERSENSE_SERVICE_PIN, INPUT_PULLUP);
   delay(5);
@@ -610,12 +730,21 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   server.on("/capture-next", HTTP_POST, [&]() {
     const bool armed = skmRequestNextCycleCapture();
     appendServiceSessionLine(
-        armed ? String(F("Next production-cycle capture ARMED"))
-              : String(F("FAILED to arm next production-cycle capture")));
+        armed ? String(F("Production scenario capture ARMED"))
+              : String(F("FAILED to arm production scenario capture")));
     server.sendHeader("Location", "/", true);
     server.send(armed ? 303 : 500,
                 "text/plain; charset=utf-8",
                 armed ? "Capture armed" : "Unable to arm capture");
+  });
+
+  server.on("/capture-cancel", HTTP_POST, [&]() {
+    const bool cancelled = skmCancelCycleCapture();
+    appendServiceSessionLine(
+        cancelled ? String(F("Scenario capture cancelled"))
+                  : String(F("Scenario capture was already inactive")));
+    server.sendHeader("Location", "/", true);
+    server.send(303, "text/plain; charset=utf-8", "Capture cancelled");
   });
 
   server.on("/logs.txt", HTTP_GET, [&]() {
@@ -662,19 +791,23 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
     html += resetLogHtml();
     html += F("<h2>Production-cycle capture</h2><div class='card'>");
     if (skmCycleCaptureRequested()) {
-      html += F("<p class='ok'><strong>ARMED:</strong> the next production "
-                "cycle will be saved once, then capture will turn off.</p>");
+      html += F("<p class='ok'><strong>ARMED:</strong> capturing successive "
+                "production wakes until return to NORMAL (maximum eight). "
+                "Remaining limit: ");
+      html += String(skmCycleCaptureRemaining());
+      html += F(".</p><form method='POST' action='/capture-cancel'>"
+                "<button type='submit'>Cancel scenario capture</button></form>");
     } else {
-      html += F("<p>Save one production cycle across RESET without continuous "
-                "flash writes.</p><form method='POST' action='/capture-next'>"
-                "<button type='submit'>Capture next production cycle</button>"
-                "</form>");
+      html += F("<p>Capture a complete multi-wake state-machine scenario across "
+                "RESET without continuous flash writes.</p>"
+                "<form method='POST' action='/capture-next'>"
+                "<button type='submit'>Capture next scenario</button></form>");
     }
     html += F("</div>");
     html += F("<h2>Logs</h2><div class='card'><p>"
               "<a href='/logs'>Open live Wi-Fi logs</a> | "
               "<a href='/logs-download'>Download logs</a></p>"
-              "<p>Includes the retained last production cycle and the current "
+              "<p>Includes the retained last production cycle, persistent scenario and current "
               "SERVICE session.</p></div>");
     html += F("<h2>OTA firmware update</h2><div class='card'><p>Upload a PlatformIO <code>firmware.bin</code>. The inactive OTA application slot is written; Zigbee storage is not intentionally erased.</p>");
     html += F("<p class='warn'><strong>After a successful upload:</strong> remove the D6-GND SERVICE jumper before rebooting if you want normal production mode.</p>");

@@ -112,21 +112,28 @@ Normal timer/GPIO deep-sleep wakes do not write the reset history to flash, so o
 
 The production-cycle trace in RTC memory is flash-write-free. However, a
 hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
-test, use **Capture next production cycle** on the SERVICE page. This stores an
-NVS request, saves exactly one subsequent production cycle before deep sleep,
-then clears the request automatically. The captured log therefore survives
-RESET and power loss without causing continuous flash writes.
+state-machine test, use **Capture next scenario** on the SERVICE page. The
+firmware then appends successive production wakes to one NVS log. Capture stops
+automatically when the state machine reaches `NORMAL`, when the eight-wake
+safety limit is reached, or when **Cancel capture** is pressed.
 
-Recommended capture workflow:
+Recommended LOW-to-HIGH scenario workflow:
 
-1. In SERVICE mode, click **Capture next production cycle**.
-2. Remove the SERVICE jumper and reboot.
-3. Let the production cycle reach deep sleep.
-4. Refit the SERVICE jumper and press RESET.
-5. Open `/logs` or download `/logs-download`.
+1. In SERVICE mode, click **Capture next scenario**.
+2. Set the floats for the intended starting condition.
+3. Remove the SERVICE jumper and reboot into production mode.
+4. Leave the device in production across every required wake. For example,
+   keep LOW closed for at least the five-minute `LOW_PENDING` confirmation;
+   do not re-enter SERVICE after the first deep sleep.
+5. Complete the scenario by opening HIGH so the state returns to `NORMAL`.
+6. Refit the SERVICE jumper, press RESET, then open `/logs` or download
+   `/logs-download`. The trace is listed chronologically as
+   `Production wake #1`, `#2`, and so on.
 
-SERVICE-session events are kept in RAM and refresh in the browser every two
-seconds.
+Each captured wake causes one deliberate NVS write, but only while this manual
+capture is armed. Normal production operation still creates no continuous log
+writes. SERVICE-session events are kept in RAM and refresh in the browser every
+two seconds.
 
 ## OTA update
 
