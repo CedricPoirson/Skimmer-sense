@@ -26,5 +26,10 @@ jobs:
       - name: Install PlatformIO
         run: python -m pip install --upgrade platformio
 
-      - name: Build XIAO ESP32-C6 firmware
+      - name: Build all firmware profiles without home Wi-Fi
         run: pio run -d firmware
+
+      - name: Build SERVICE mode with home Wi-Fi credentials
+        run: |
+          cp firmware/include/wifi_secrets.example.h firmware/include/wifi_secrets.h
+          pio run -d firmware -e seeed_xiao_esp32c6_sleep_zigbee_production
