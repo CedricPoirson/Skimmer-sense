@@ -339,6 +339,9 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   const String apPassword = String("SKM-") + suffixText;
 
   WiFi.mode(WIFI_AP_STA);
+  // SERVICE mode is temporary and usually USB-powered: keep Wi-Fi awake for
+  // responsive diagnostics and reliable OTA transfers.
+  WiFi.setSleep(false);
   const bool apOk = WiFi.softAP(apSsid.c_str(), apPassword.c_str());
   const IPAddress apIp = WiFi.softAPIP();
 
