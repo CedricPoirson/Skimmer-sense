@@ -116,6 +116,11 @@ is deliberately withheld until the five-minute anti-wave confirmation
 completes; this prevents Home Assistant from treating an unconfirmed startup
 contact as a refill request.
 
+Zigbee startup has two separately logged 30-second limits: one for
+`Zigbee.begin()`/ZBOSS initialization and one for network reconnection. A
+normal successful wake usually completes much sooner, so the longer limits only
+increase awake time when Zigbee is already failing.
+
 The production-cycle trace in RTC memory is flash-write-free. However, a
 hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
 long-running test, use **Capture next 50 wakes** on the SERVICE page. The

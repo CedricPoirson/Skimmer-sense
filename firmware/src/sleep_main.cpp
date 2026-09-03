@@ -26,8 +26,12 @@
 #define SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS 60ULL
 #endif
 
+#ifndef SKIMMERSENSE_ZIGBEE_BEGIN_TIMEOUT_MS
+#define SKIMMERSENSE_ZIGBEE_BEGIN_TIMEOUT_MS 30000UL
+#endif
+
 #ifndef SKIMMERSENSE_ZIGBEE_WAIT_MS
-#define SKIMMERSENSE_ZIGBEE_WAIT_MS 10000UL
+#define SKIMMERSENSE_ZIGBEE_WAIT_MS 30000UL
 #endif
 
 #ifndef SKIMMERSENSE_SERIAL_STARTUP_MS
@@ -381,15 +385,24 @@ bool startZigbee() {
   zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout =
       ESP_ZB_ED_AGING_TIMEOUT_2048MIN;
   zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 10000;
-  Zigbee.setTimeout(10000);
+  Zigbee.setTimeout(SKIMMERSENSE_ZIGBEE_BEGIN_TIMEOUT_MS);
 
   Serial.println("Starting Zigbee sleepy End Device...");
   skmCycleLogAppend("Zigbee: starting sleepy End Device");
+  const uint32_t beginStartedAt = millis();
   if (!Zigbee.begin(&zigbeeConfig, false)) {
-    Serial.println("Zigbee begin failed");
-    skmCycleLogAppend("Zigbee: begin FAILED");
+    const uint32_t elapsed = millis() - beginStartedAt;
+    Serial.printf("Zigbee begin failed after %lu ms\n",
+                  static_cast<unsigned long>(elapsed));
+    skmCycleLogAppend("Zigbee: begin FAILED after %lu ms",
+                      static_cast<unsigned long>(elapsed));
     return false;
   }
+  const uint32_t beginElapsed = millis() - beginStartedAt;
+  Serial.printf("Zigbee stack started in %lu ms\n",
+                static_cast<unsigned long>(beginElapsed));
+  skmCycleLogAppend("Zigbee: stack started in %lu ms",
+                    static_cast<unsigned long>(beginElapsed));
 
   Serial.print("Waiting for Zigbee network");
   const uint32_t startedAt = millis();
@@ -400,8 +413,11 @@ bool startZigbee() {
   Serial.println();
 
   if (!Zigbee.connected()) {
-    Serial.println("Zigbee reconnect timeout");
-    skmCycleLogAppend("Zigbee: reconnect TIMEOUT");
+    const uint32_t elapsed = millis() - startedAt;
+    Serial.printf("Zigbee reconnect timeout after %lu ms\n",
+                  static_cast<unsigned long>(elapsed));
+    skmCycleLogAppend("Zigbee: reconnect TIMEOUT after %lu ms",
+                      static_cast<unsigned long>(elapsed));
     return false;
   }
 
