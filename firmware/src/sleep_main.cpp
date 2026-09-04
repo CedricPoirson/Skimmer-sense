@@ -67,6 +67,17 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #define SKIMMERSENSE_POST_REPORT_WAIT_MS 2000UL
 #endif
 
+// The end-of-refill transition is safety-critical. Because the validated
+// Arduino/ZBOSS stack does not emit delivery callbacks for attribute reports,
+// transmit the final LOW/HIGH state several times in the same awake window.
+#ifndef SKIMMERSENSE_CRITICAL_FINAL_REPORT_COPIES
+#define SKIMMERSENSE_CRITICAL_FINAL_REPORT_COPIES 3U
+#endif
+
+#ifndef SKIMMERSENSE_CRITICAL_FINAL_REPORT_GAP_MS
+#define SKIMMERSENSE_CRITICAL_FINAL_REPORT_GAP_MS 1000UL
+#endif
+
 #include "Zigbee.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
@@ -1085,20 +1096,55 @@ void setup() {
       }
 
       if (plan.reportFloats) {
-        // LOW first, then HIGH. During refill this lets HA see OFF/ON briefly
-        // before OFF/OFF when the high float opens.
-        reportsOk &= sendSafeReport(
-            ZB_EP_LOW_LEVEL,
-            ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-            ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
-            "low-float");
-        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
-        reportsOk &= sendSafeReport(
-            ZB_EP_HIGH_LEVEL,
-            ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-            ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
-            "high-float");
-        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+        const bool criticalRefillCompletion =
+            state == LevelState::WAIT_HIGH && !snapshot.highClosed;
+        const uint8_t floatReportCopies =
+            criticalRefillCompletion
+                ? static_cast<uint8_t>(
+                      SKIMMERSENSE_CRITICAL_FINAL_REPORT_COPIES)
+                : 1U;
+
+        if (criticalRefillCompletion) {
+          Serial.printf(
+              "Critical HIGH completion: sending %u LOW/HIGH copies "
+              "before sleep.\n",
+              static_cast<unsigned>(floatReportCopies));
+          skmCycleLogAppend(
+              "Critical HIGH completion: %u LOW/HIGH copies requested",
+              static_cast<unsigned>(floatReportCopies));
+        }
+
+        for (uint8_t copy = 0; copy < floatReportCopies; ++copy) {
+          if (criticalRefillCompletion) {
+            Serial.printf("Critical final-state copy %u/%u...\n",
+                          static_cast<unsigned>(copy + 1U),
+                          static_cast<unsigned>(floatReportCopies));
+            skmCycleLogAppend("Critical final-state copy %u/%u",
+                              static_cast<unsigned>(copy + 1U),
+                              static_cast<unsigned>(floatReportCopies));
+          }
+
+          // LOW first, then HIGH. Home Assistant closes the valve as soon as
+          // HIGH=OFF is received. Repeating both attributes also restores a
+          // coherent final snapshot if an earlier frame was lost.
+          reportsOk &= sendSafeReport(
+              ZB_EP_LOW_LEVEL,
+              ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+              ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+              "low-float");
+          delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+          reportsOk &= sendSafeReport(
+              ZB_EP_HIGH_LEVEL,
+              ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+              ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+              "high-float");
+
+          if (copy + 1U < floatReportCopies) {
+            delay(SKIMMERSENSE_CRITICAL_FINAL_REPORT_GAP_MS);
+          } else {
+            delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+          }
+        }
       }
 
       if (snapshot.batteryValid) {
