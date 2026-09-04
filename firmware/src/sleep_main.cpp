@@ -149,28 +149,32 @@ void expectZigbeeReportConfirmation(uint8_t endpoint) {
   zbReportConfirmations[index].tsn = 0;
 }
 
-bool logZigbeeReportConfirmations() {
-  bool allConfirmed = true;
-  bool anyExpected = false;
+bool logZigbeeReportConfirmationFailures() {
+  bool explicitFailureDetected = false;
 
   for (size_t index = 0; index < 3; ++index) {
     const ZigbeeReportConfirmation &confirmation =
         zbReportConfirmations[index];
     if (!confirmation.expected) continue;
-    anyExpected = true;
 
+    // Arduino-ESP32/ZBOSS does not emit this callback for attribute-report
+    // commands on the validated stack version. Missing callback data is
+    // therefore diagnostic-only and must never shorten the production sleep.
     if (!confirmation.received) {
-      allConfirmed = false;
-      Serial.printf("Report %-12s: delivery confirmation NOT RECEIVED\n",
-                    reportConfirmationLabel(index));
-      skmCycleLogAppend("Report %s: delivery confirmation NOT RECEIVED",
-                        reportConfirmationLabel(index));
+      Serial.printf(
+          "Report %-12s: delivery confirmation unavailable "
+          "(stack callback not emitted)\n",
+          reportConfirmationLabel(index));
+      skmCycleLogAppend(
+          "Report %s: delivery confirmation unavailable "
+          "(stack callback not emitted)",
+          reportConfirmationLabel(index));
       continue;
     }
 
     const esp_err_t status = confirmation.status;
     const bool ok = status == ESP_OK;
-    allConfirmed &= ok;
+    explicitFailureDetected |= !ok;
     Serial.printf("Report %-12s: delivery %s / TSN %u / 0x%x (%s)\n",
                   reportConfirmationLabel(index),
                   ok ? "CONFIRMED" : "FAILED",
@@ -185,7 +189,7 @@ bool logZigbeeReportConfirmations() {
                       esp_err_to_name(status));
   }
 
-  return anyExpected && allConfirmed;
+  return explicitFailureDetected;
 }
 
 static constexpr uint32_t RTC_MAGIC = 0x534B4D31UL;  // "SKM1"
@@ -1105,21 +1109,25 @@ void setup() {
                     static_cast<unsigned long>(SKIMMERSENSE_POST_REPORT_WAIT_MS));
       delay(SKIMMERSENSE_POST_REPORT_WAIT_MS);
 
-      const bool deliveriesConfirmed = logZigbeeReportConfirmations();
+      const bool explicitDeliveryFailure =
+          logZigbeeReportConfirmationFailures();
       logZigbeeParentReception("after reports");
 
       Serial.printf(
-          "Zigbee cycle survived. Queueing: %s / delivery confirmations: %s\n",
+          "Zigbee cycle survived. Queueing: %s / callback failure: %s\n",
           reportsOk ? "ALL OK" : "PARTIAL/FAILED",
-          deliveriesConfirmed ? "ALL CONFIRMED" : "PARTIAL/MISSING");
+          explicitDeliveryFailure ? "DETECTED" : "NONE");
       skmCycleLogAppend(
-          "Zigbee cycle survived. Queueing: %s / delivery confirmations: %s",
+          "Zigbee cycle survived. Queueing: %s / callback failure: %s",
           reportsOk ? "ALL OK" : "PARTIAL/FAILED",
-          deliveriesConfirmed ? "ALL CONFIRMED" : "PARTIAL/MISSING");
-      if (!reportsOk || !deliveriesConfirmed) {
+          explicitDeliveryFailure ? "DETECTED" : "NONE");
+
+      // Retry early only for a real local queueing error or an explicit
+      // negative callback. An absent callback is expected on this stack.
+      if (!reportsOk || explicitDeliveryFailure) {
         scheduleZigbeeRecovery(
             plan,
-            reportsOk ? "missing/failed delivery confirmation"
+            reportsOk ? "explicit delivery callback failure"
                       : "report queueing failure");
       }
     }
