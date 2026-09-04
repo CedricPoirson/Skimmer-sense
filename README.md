@@ -1,12 +1,56 @@
 # SkimmerSense
 
-Battery-powered Zigbee pool-skimmer monitor for Home Assistant, built around a Seeed Studio XIAO ESP32-C6.
+> **A battery-powered Zigbee sensor that turns a pool skimmer into a safe, observable automatic-refill system for Home Assistant.**
 
-SkimmerSense measures pool-water temperature, monitors two mechanical water-level floats and reads battery telemetry locally through a MAX17048 fuel gauge. Home Assistant uses the two level inputs to supervise a separate refill circuit with multiple safety layers.
+## Why SkimmerSense?
+
+Pool level slowly drops through evaporation, splashing and filter maintenance. Refilling by hand is easy to forget, while opening a valve automatically from a single level switch creates a different risk: waves, swimmers, a stuck sensor or a lost radio message can all produce the wrong decision.
+
+SkimmerSense separates **measurement** from **water control**. A small battery-powered sensor installed in the skimmer measures water temperature and watches two mechanical floats. It sends those states over Zigbee to Home Assistant, which supervises a fixed IPX800 relay and a normally-closed 24 VAC valve.
+
+The result is a local, cloud-free refill system with physical hysteresis, wave rejection, immediate high-level detection and several independent ways to stop the water.
+
+## What it does
+
+| Capability | Benefit |
+|---|---|
+| Two vertical float switches | Separate refill-start and refill-stop thresholds |
+| Five-minute LOW confirmation | Rejects waves, splashing and temporary swimmer movement |
+| Immediate GPIO wake | Reacts to meaningful level changes without continuous polling |
+| Waterproof DS18B20 | Adds pool-water temperature to Home Assistant |
+| Zigbee sleepy End Device | Integrates locally with Zigbee2MQTT while preserving battery life |
+| Temperature-adaptive deep sleep | Reports more often when useful and sleeps longer in mild conditions |
+| Critical completion redundancy | Sends the final LOW/HIGH state three times when the high level is reached |
+| MAX17048 fuel gauge | Measures battery voltage and state of charge locally |
+| SERVICE jumper | Enables Wi-Fi diagnostics, retained logs and browser-based OTA updates |
+| Layered safety | Home Assistant timeout, independent IPX800 timeout and normally-closed valve |
+
+## Typical refill cycle
+
+1. Water drops below the LOW float.
+2. SkimmerSense waits for LOW to remain continuously active for five minutes.
+3. A transient caused by a wave or swimmer is rejected immediately if LOW reopens.
+4. Once confirmed, Home Assistant may start filling during the configured overnight window.
+5. SkimmerSense ignores LOW while filling and watches the HIGH float.
+6. When HIGH opens, the ESP32-C6 wakes immediately and publishes the final state three times.
+7. Home Assistant closes the valve; independent timeouts remain available if any component fails.
+
+> [!IMPORTANT]
+> SkimmerSense never powers the valve directly. The battery device only measures and reports. Water control stays on the fixed Home Assistant/IPX800 side, with a normally-closed valve and an independent maximum-open timeout.
+
+## Project at a glance
+
+- **Sensor:** Seeed Studio XIAO ESP32-C6 with external 2.4 GHz antenna
+- **Network:** Zigbee channel 20 through Zigbee2MQTT
+- **Measurements:** LOW float, HIGH float, water temperature and local battery telemetry
+- **Automation:** Home Assistant controlling an IPX800 V4 dry-contact relay
+- **Power:** protected 1S 18650 battery with deep sleep
+- **Maintenance:** D6/GPIO16 jumper, Wi-Fi portal, downloadable diagnostics and OTA
+- **Current firmware:** v0.9.1 production candidate
 
 ## Current status
 
-The `firmware-v0.9` branch is a hardware-validated production candidate.
+Firmware **v0.9.1** is a hardware-validated production candidate. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
 
 Validated on the current XIAO ESP32-C6 prototype:
 
@@ -30,6 +74,7 @@ Validated on the current XIAO ESP32-C6 prototype:
 - immediate LOW GPIO wake remains functional while a long adaptive timer is armed
 - production `WAIT_HIGH` 30-minute fallback remains independent from the adaptive `NORMAL` timer
 - HIGH GPIO wake returns immediately from `WAIT_HIGH` to `NORMAL` and resumes the correct adaptive interval
+- refill completion sends three redundant LOW/HIGH report sequences before sleep
 
 ### Production-candidate timing profile
 
@@ -260,6 +305,21 @@ The Home Assistant strategy is deliberately conservative:
 The sensor, Zigbee and Home Assistant/IPX dry-contact logic are validated. The final 24 VAC solenoid valve is not yet physically connected, so the complete hydraulic chain is still pending.
 
 See [`home-assistant/README.md`](home-assistant/README.md) for the Home Assistant implementation notes.
+
+## SERVICE mode
+
+A jumper between **D6/GPIO16 and GND**, followed by RESET, starts a maintenance environment instead of Zigbee production mode. The device stays awake, joins the configured home Wi-Fi when available and also creates a private fallback access point.
+
+From a browser, SERVICE mode provides:
+
+- live sensor and battery diagnostics;
+- reset history and retained production-cycle traces;
+- an optional 50-wake scenario capture;
+- downloadable logs;
+- firmware upload to the inactive OTA slot;
+- access through `http://skimmersense.local/` or the fallback AP.
+
+Remove the jumper and reboot to return to Zigbee/deep-sleep operation. See [`docs/service-mode.md`](docs/service-mode.md) for setup and recovery instructions.
 
 ## Firmware
 
