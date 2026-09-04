@@ -82,7 +82,7 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.1-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.2-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -203,7 +203,7 @@ bool logZigbeeReportConfirmationFailures() {
   return explicitFailureDetected;
 }
 
-static constexpr uint32_t RTC_MAGIC = 0x534B4D31UL;  // "SKM1"
+static constexpr uint32_t RTC_MAGIC = 0x534B4D32UL;  // "SKM2"
 
 enum class LevelState : uint8_t {
   NORMAL = 0,
@@ -213,6 +213,13 @@ enum class LevelState : uint8_t {
 
 RTC_DATA_ATTR uint32_t rtcMagic = 0;
 RTC_DATA_ATTR uint8_t rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
+
+// A HIGH-open event ends the refill and must survive failed Zigbee startups.
+// The captured final float snapshot is retransmitted until all three copies
+// have been accepted by the local Zigbee stack.
+RTC_DATA_ATTR bool rtcFinalReportPending = false;
+RTC_DATA_ATTR bool rtcFinalLowClosed = false;
+RTC_DATA_ATTR bool rtcFinalHighClosed = false;
 
 // Last valid adaptive NORMAL interval retained across deep sleep.
 // Short event-only wakes can therefore skip the DS18B20 conversion.
@@ -720,15 +727,32 @@ bool armOppositeLevelWake(uint8_t pin, bool currentHigh, const char *label) {
 }
 
 LevelState loadState(esp_sleep_wakeup_cause_t cause) {
-  if (cause == ESP_SLEEP_WAKEUP_UNDEFINED || rtcMagic != RTC_MAGIC ||
-      rtcStateRaw > static_cast<uint8_t>(LevelState::WAIT_HIGH)) {
+  const bool rtcInvalid =
+      rtcMagic != RTC_MAGIC ||
+      rtcStateRaw > static_cast<uint8_t>(LevelState::WAIT_HIGH);
+
+  if (rtcInvalid) {
     rtcMagic = RTC_MAGIC;
+    rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
+    rtcFinalReportPending = false;
+    rtcFinalLowClosed = false;
+    rtcFinalHighClosed = false;
+    rtcNormalSleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+    rtcLastWaterTemperatureC = 20.0f;
+    rtcNormalSleepValid = false;
+    return LevelState::NORMAL;
+  }
+
+  if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    // Reset the state machine after a cold/software boot, but preserve a
+    // valid pending final report when RTC memory itself survived the reset.
     rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
     rtcNormalSleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
     rtcLastWaterTemperatureC = 20.0f;
     rtcNormalSleepValid = false;
     return LevelState::NORMAL;
   }
+
   return static_cast<LevelState>(rtcStateRaw);
 }
 
@@ -862,6 +886,19 @@ CyclePlan makePlan(LevelState state,
   return plan;
 }
 
+void applyPendingFinalReport(CyclePlan &plan) {
+  if (!rtcFinalReportPending) return;
+
+  plan.nextState = LevelState::NORMAL;
+  plan.useZigbee = true;
+  plan.reportFloats = true;
+  plan.watchLow = true;
+  plan.watchHigh = false;
+  plan.watchMax = true;
+  plan.reason =
+      "pending refill-completion snapshot -> retry three LOW/HIGH copies";
+}
+
 [[noreturn]] void enterPlannedSleep(CyclePlan plan) {
   const LevelState previousState =
     static_cast<LevelState>(rtcStateRaw);
@@ -984,12 +1021,24 @@ void setup() {
   // First decide from floats and wake cause only.
   // Power the DS18B20 only if this cycle actually needs a fresh
   // temperature value/report.
+  if (state == LevelState::WAIT_HIGH && !snapshot.highClosed) {
+    rtcFinalReportPending = true;
+    rtcFinalLowClosed = snapshot.lowClosed;
+    rtcFinalHighClosed = snapshot.highClosed;
+    Serial.println(
+        "Critical HIGH completion captured in RTC; transmission pending.");
+    skmCycleLogAppend(
+        "Critical HIGH completion captured in RTC; transmission pending");
+  }
+
   CyclePlan plan = makePlan(state, snapshot, cause, extMask);
+  applyPendingFinalReport(plan);
   const bool temperatureReadRequested = plan.reportTemperature;
 
   if (temperatureReadRequested) {
     readTemperatureIntoSnapshot(snapshot);
     plan = makePlan(state, snapshot, cause, extMask);
+    applyPendingFinalReport(plan);
   }
 
   Serial.printf("Float LOW : %s\n",
@@ -1063,9 +1112,21 @@ void setup() {
 #endif
 
 
+  SensorSnapshot zigbeeSnapshot = snapshot;
+  if (rtcFinalReportPending) {
+    zigbeeSnapshot.lowClosed = rtcFinalLowClosed;
+    zigbeeSnapshot.highClosed = rtcFinalHighClosed;
+    Serial.printf("Pending final snapshot: LOW=%s HIGH=%s\n",
+                  contactState(zigbeeSnapshot.lowClosed),
+                  contactState(zigbeeSnapshot.highClosed));
+    skmCycleLogAppend("Pending final snapshot: LOW=%s HIGH=%s",
+                      contactState(zigbeeSnapshot.lowClosed),
+                      contactState(zigbeeSnapshot.highClosed));
+  }
+
   if (plan.useZigbee) {
     Serial.println("Preloading Zigbee attributes BEFORE Zigbee.begin()...");
-    if (!configureZigbeeEndpoints(snapshot)) {
+    if (!configureZigbeeEndpoints(zigbeeSnapshot)) {
       Serial.println("Preload/configuration FAILED; sleeping without Zigbee.");
       scheduleZigbeeRecovery(plan, "endpoint configuration failure");
       plan.useZigbee = false;
@@ -1096,8 +1157,7 @@ void setup() {
       }
 
       if (plan.reportFloats) {
-        const bool criticalRefillCompletion =
-            state == LevelState::WAIT_HIGH && !snapshot.highClosed;
+        const bool criticalRefillCompletion = rtcFinalReportPending;
         const uint8_t floatReportCopies =
             criticalRefillCompletion
                 ? static_cast<uint8_t>(
@@ -1158,6 +1218,16 @@ void setup() {
       const bool explicitDeliveryFailure =
           logZigbeeReportConfirmationFailures();
       logZigbeeParentReception("after reports");
+
+      if (rtcFinalReportPending && reportsOk && !explicitDeliveryFailure) {
+        rtcFinalReportPending = false;
+        Serial.println(
+            "Critical final snapshot accepted by Zigbee stack; "
+            "RTC pending flag cleared.");
+        skmCycleLogAppend(
+            "Critical final snapshot accepted by Zigbee stack; "
+            "RTC pending flag cleared");
+      }
 
       Serial.printf(
           "Zigbee cycle survived. Queueing: %s / callback failure: %s\n",
