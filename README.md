@@ -20,7 +20,7 @@ The result is a local, cloud-free refill system with physical hysteresis, wave r
 | Waterproof DS18B20 | Adds pool-water temperature to Home Assistant |
 | Zigbee sleepy End Device | Integrates locally with Zigbee2MQTT while preserving battery life |
 | Temperature-adaptive deep sleep | Reports more often when useful and sleeps longer in mild conditions |
-| Critical completion redundancy | Sends the final LOW/HIGH state three times when the high level is reached |
+| Persistent critical completion | Retains the final LOW/HIGH snapshot in RTC and retries three-copy delivery after Zigbee failures |
 | MAX17048 fuel gauge | Measures battery voltage and state of charge locally |
 | SERVICE jumper | Enables Wi-Fi diagnostics, retained logs and browser-based OTA updates |
 | Layered safety | Home Assistant timeout, independent IPX800 timeout and normally-closed valve |
@@ -32,8 +32,8 @@ The result is a local, cloud-free refill system with physical hysteresis, wave r
 3. A transient caused by a wave or swimmer is rejected immediately if LOW reopens.
 4. Once confirmed, Home Assistant may start filling during the configured overnight window.
 5. SkimmerSense ignores LOW while filling and watches the HIGH float.
-6. When HIGH opens, the ESP32-C6 wakes immediately and publishes the final state three times.
-7. Home Assistant closes the valve; independent timeouts remain available if any component fails.
+6. When HIGH opens, the ESP32-C6 stores the final state in RTC memory and publishes it three times.
+7. If Zigbee cannot start or queue every copy, the retained event is retried after five minutes. Home Assistant closes the valve on the first received HIGH=OFF report.
 
 > [!IMPORTANT]
 > SkimmerSense never powers the valve directly. The battery device only measures and reports. Water control stays on the fixed Home Assistant/IPX800 side, with a normally-closed valve and an independent maximum-open timeout.
@@ -46,11 +46,11 @@ The result is a local, cloud-free refill system with physical hysteresis, wave r
 - **Automation:** Home Assistant controlling an IPX800 V4 dry-contact relay
 - **Power:** protected 1S 18650 battery with deep sleep
 - **Maintenance:** D6/GPIO16 jumper, Wi-Fi portal, downloadable diagnostics and OTA
-- **Current firmware:** v0.9.1 production candidate
+- **Current firmware:** v0.9.2 production candidate
 
 ## Current status
 
-Firmware **v0.9.1** is a hardware-validated production candidate. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
+Firmware **v0.9.2** is a hardware-validated production candidate. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
 
 Validated on the current XIAO ESP32-C6 prototype:
 
@@ -74,7 +74,7 @@ Validated on the current XIAO ESP32-C6 prototype:
 - immediate LOW GPIO wake remains functional while a long adaptive timer is armed
 - production `WAIT_HIGH` 30-minute fallback remains independent from the adaptive `NORMAL` timer
 - HIGH GPIO wake returns immediately from `WAIT_HIGH` to `NORMAL` and resumes the correct adaptive interval
-- refill completion sends three redundant LOW/HIGH report sequences before sleep
+- refill completion is retained in RTC and sends three redundant LOW/HIGH report sequences before sleep
 
 ### Production-candidate timing profile
 
