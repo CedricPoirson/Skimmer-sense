@@ -103,7 +103,7 @@ The adaptive profile has been exercised on the real prototype at 24.50 C: produc
 
 Because the production profile can sleep for up to 6 hours, the Zigbee End Device aging timeout is explicitly set to `ESP_ZB_ED_AGING_TIMEOUT_2048MIN` (about 34 hours), rather than relying on the shorter framework default.
 
-Still to validate before merging v0.9 to `main`:
+Still to validate before tagging the first production-ready release:
 
 - final protected 1S 18650 in battery-only operation
 - real MAX17048 low-battery `INT/ALRT` wake
@@ -156,7 +156,7 @@ Core components:
 
 See [`hardware/bom.md`](hardware/bom.md) for the bill of materials and [`hardware/wiring.md`](hardware/wiring.md) for the pinout.
 
-## Pin functions used by v0.9
+## Current pin functions
 
 | XIAO pin | GPIO | Function |
 |---|---:|---|
