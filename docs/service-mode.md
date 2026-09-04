@@ -128,10 +128,11 @@ is deliberately withheld until the five-minute anti-wave confirmation
 completes; this prevents Home Assistant from treating an unconfirmed startup
 contact as a refill request.
 
-Zigbee startup has two separately logged 30-second limits: one for
-`Zigbee.begin()`/ZBOSS initialization and one for network reconnection. A
-normal successful wake usually completes much sooner, so the longer limits only
-increase awake time when Zigbee is already failing.
+Production Zigbee startup has two separately logged 45-second limits: one for
+`Zigbee.begin()`/ZBOSS initialization and one for network reconnection. The
+limit was raised after real 30-second captures showed successful starts taking
+up to roughly 26 seconds and repeated failures at the old boundary. A normal
+successful wake usually completes much sooner.
 
 The anti-wave and production profiles constrain discovery/reconnection to
 **Zigbee channel 20**, matching the deployed coordinator. This avoids scanning
@@ -150,6 +151,15 @@ If endpoint configuration, Zigbee startup/reconnection, or attribute queuing
 fails, the next timer wake is capped at **5 minutes**. Float GPIO wake sources
 and the state-machine state remain unchanged. The normal temperature-dependent
 interval resumes automatically after a successful Zigbee cycle.
+
+Refill completion is treated as a persistent critical event. When HIGH opens in
+`WAIT_HIGH`, the final LOW/HIGH snapshot is retained in RTC memory before
+Zigbee starts. The firmware sends three copies one second apart. If endpoint
+configuration, stack startup, reconnection or report queuing fails, the pending
+snapshot remains armed and is retried after five minutes. It is cleared only
+after all three copies have been accepted by the local Zigbee stack. A complete
+power loss can still clear RTC memory, so the independent Home Assistant and
+IPX800 valve-open timeouts remain mandatory.
 
 The production-cycle trace in RTC memory is flash-write-free. However, a
 hardware RESET can clear RTC memory on the XIAO ESP32-C6. For a deterministic
