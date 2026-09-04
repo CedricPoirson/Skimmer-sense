@@ -82,7 +82,7 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.1-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
