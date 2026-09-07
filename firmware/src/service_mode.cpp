@@ -341,21 +341,21 @@ footer{color:var(--muted);font-size:12px;padding:20px 0 35px;text-align:center}
   html += F("</div><div class='card third'><div class='eyebrow'>Point d’accès secours</div><div class='value'>");
   html += apSsid; html += F("</div><div class='sub'>"); html += apIp.toString();
   html += F(" · mot de passe <code>"); html += apPassword; html += F("</code></div></div></div>");
-  return html;
-}
-
-String pageFooter() {
-  return F(R"HTML(<footer>SkimmerSense · interface locale autonome</footer></main>
-<div id="toast" class="toast"></div>
+  html += F(R"HTML(<div id="toast" class="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
 function toast(message,error=false){const t=$('toast');if(!t)return;t.textContent=message;t.className='toast show'+(error?' error':'');clearTimeout(window._toastTimer);window._toastTimer=setTimeout(()=>t.className='toast',4200)}
 function formatUptime(seconds){seconds=Number(seconds)||0;const d=Math.floor(seconds/86400),h=Math.floor(seconds%86400/3600),m=Math.floor(seconds%3600/60);return(d?d+' j ':'')+(h?h+' h ':'')+m+' min'}
 async function postAction(url,success){try{const r=await fetch(url+'?ajax=1',{method:'POST',cache:'no-store'});let d={};try{d=await r.json()}catch(e){}if(!r.ok||d.ok===false)throw new Error(d.message||'Action refusée');toast(d.message||success);if(window.refreshDashboard)setTimeout(window.refreshDashboard,350)}catch(e){toast(e.message||String(e),true)}}
-</script></body></html>)HTML");
+</script>)HTML");
+  return html;
 }
 
-}  // namespace}  // namespace
+String pageFooter() {
+  return F("<footer>SkimmerSense · interface locale autonome</footer></main></body></html>");
+}
+
+}  // namespace
 
 void skmCycleLogBegin() {
   retainedCycleLog.magic = CYCLE_LOG_MAGIC;
