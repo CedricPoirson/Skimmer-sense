@@ -179,6 +179,21 @@ String buildMax17048AdvancedHtml(const SensorSnapshot &snapshot) {
   return html;
 }
 
+const char *batteryServiceDisplayName(const SensorSnapshot &snapshot,
+                                      BatteryAssessment assessment) {
+  const bool plausibleCharge =
+      snapshot.batteryRateValid &&
+      snapshot.batteryRatePercentPerHour >= 0.5f &&
+      snapshot.batteryRatePercentPerHour <= 25.0f;
+  if (plausibleCharge && assessment == BatteryAssessment::LOW_LEVEL) {
+    return "FAIBLE - EN CHARGE";
+  }
+  if (plausibleCharge && assessment == BatteryAssessment::CRITICAL) {
+    return "CRITIQUE - EN CHARGE";
+  }
+  return batteryAssessmentName(assessment);
+}
+
 String buildServiceHardwareHtml() {
   SensorSnapshot snapshot = readBaseSensorSnapshot();
   readTemperatureIntoSnapshot(snapshot);
@@ -208,7 +223,7 @@ String buildServiceHardwareHtml() {
     html += F("<div class='batterybox ");
     html += tone;
     html += F("'><div class='batteryhead'><div><span class='eyebrow'>Batterie</span><div class='batterystate'>");
-    html += batteryAssessmentName(assessment);
+    html += batteryServiceDisplayName(snapshot, assessment);
     html += F("</div></div><strong>");
     html += String(snapshot.batteryPercent);
     html += F(" %</strong></div><div class='batterytrack'><span style='width:");
