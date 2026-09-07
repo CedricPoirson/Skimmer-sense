@@ -82,7 +82,7 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.3-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.4-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -102,9 +102,16 @@ static constexpr uint8_t MAX17048_REG_VCELL = 0x02;
 static constexpr uint8_t MAX17048_REG_SOC = 0x04;
 static constexpr uint8_t MAX17048_REG_VERSION = 0x08;
 static constexpr uint8_t MAX17048_REG_CONFIG = 0x0C;
+static constexpr uint8_t MAX17048_REG_CRATE = 0x16;
 static constexpr uint8_t MAX17048_REG_STATUS = 0x1A;
 static constexpr uint16_t MAX17048_CONFIG_ALRT = 0x0020;
 static constexpr uint8_t MAX17048_STATUS_RI = 0x01;
+static constexpr uint8_t MAX17048_STATUS_VH = 0x02;
+static constexpr uint8_t MAX17048_STATUS_VL = 0x04;
+static constexpr uint8_t MAX17048_STATUS_VR = 0x08;
+static constexpr uint8_t MAX17048_STATUS_HD = 0x10;
+static constexpr uint8_t MAX17048_STATUS_SC = 0x20;
+static constexpr float MAX17048_CRATE_LSB_PERCENT_PER_HOUR = 0.208f;
 
 static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
 static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
@@ -264,6 +271,10 @@ struct SensorSnapshot {
   float batterySocRaw = 0.0f;
   uint8_t batteryPercent = 100;
   uint8_t batteryVoltageZcl = 40;
+  bool batteryRateValid = false;
+  float batteryRatePercentPerHour = 0.0f;
+  uint8_t batteryStatus = 0;
+  bool batteryResetDetected = false;
   bool temperatureValid = false;
   float waterTemperatureC = 20.0f;
 };
@@ -291,6 +302,96 @@ const char *stateName(LevelState state) {
 
 const char *contactState(bool closed) {
   return closed ? "CLOSED" : "OPEN";
+}
+
+enum class BatteryAssessment : uint8_t {
+  UNAVAILABLE = 0,
+  STABILIZING,
+  FULL,
+  CHARGING,
+  STABLE,
+  DISCHARGING,
+  LOW,
+  CRITICAL,
+};
+
+BatteryAssessment assessBattery(const SensorSnapshot &snapshot) {
+  if (!snapshot.batteryValid) return BatteryAssessment::UNAVAILABLE;
+  if (snapshot.batteryPercent <= 10 || snapshot.batteryVoltage < 3.35f) {
+    return BatteryAssessment::CRITICAL;
+  }
+  if (snapshot.batteryPercent <= 20 || snapshot.batteryVoltage < 3.50f) {
+    return BatteryAssessment::LOW;
+  }
+
+  const float rate = snapshot.batteryRatePercentPerHour;
+  if (snapshot.batteryResetDetected ||
+      (snapshot.batteryRateValid && fabsf(rate) > 25.0f)) {
+    return BatteryAssessment::STABILIZING;
+  }
+  if (snapshot.batteryPercent >= 95 &&
+      snapshot.batteryVoltage >= 4.10f &&
+      (!snapshot.batteryRateValid || fabsf(rate) < 1.0f)) {
+    return BatteryAssessment::FULL;
+  }
+  if (!snapshot.batteryRateValid || fabsf(rate) < 0.5f) {
+    return BatteryAssessment::STABLE;
+  }
+  return rate > 0.0f
+           ? BatteryAssessment::CHARGING
+           : BatteryAssessment::DISCHARGING;
+}
+
+const char *batteryAssessmentName(BatteryAssessment assessment) {
+  switch (assessment) {
+    case BatteryAssessment::STABILIZING: return "ESTIMATION EN COURS";
+    case BatteryAssessment::FULL: return "PLEINE";
+    case BatteryAssessment::CHARGING: return "EN CHARGE";
+    case BatteryAssessment::STABLE: return "STABLE";
+    case BatteryAssessment::DISCHARGING: return "EN DECHARGE";
+    case BatteryAssessment::LOW: return "FAIBLE";
+    case BatteryAssessment::CRITICAL: return "CRITIQUE";
+    default: return "INDISPONIBLE";
+  }
+}
+
+bool batteryEstimateHours(const SensorSnapshot &snapshot,
+                          float &hours,
+                          bool &untilFull) {
+  hours = 0.0f;
+  untilFull = false;
+  if (!snapshot.batteryValid || !snapshot.batteryRateValid) return false;
+
+  const BatteryAssessment assessment = assessBattery(snapshot);
+  const float rate = snapshot.batteryRatePercentPerHour;
+  if (assessment == BatteryAssessment::CHARGING &&
+      rate >= 0.5f && rate <= 25.0f) {
+    hours = (100.0f - snapshot.batterySocRaw) / rate;
+    untilFull = true;
+  } else if (assessment == BatteryAssessment::DISCHARGING &&
+             rate <= -0.5f && rate >= -25.0f) {
+    hours = snapshot.batterySocRaw / -rate;
+    untilFull = false;
+  } else {
+    return false;
+  }
+  return isfinite(hours) && hours >= 0.0f && hours <= 240.0f;
+}
+
+String batteryAlertSummary(const SensorSnapshot &snapshot) {
+  if (!snapshot.batteryValid) return String(F("unavailable"));
+  String alerts;
+  const auto add = [&](const __FlashStringHelper *label) {
+    if (alerts.length()) alerts += F(", ");
+    alerts += label;
+  };
+  if (snapshot.batteryStatus & MAX17048_STATUS_HD) add(F("low SOC"));
+  if (snapshot.batteryStatus & MAX17048_STATUS_VL) add(F("low voltage"));
+  if (snapshot.batteryStatus & MAX17048_STATUS_VH) add(F("high voltage"));
+  if (snapshot.batteryStatus & MAX17048_STATUS_VR) add(F("voltage reset"));
+  if (snapshot.batteryStatus & MAX17048_STATUS_SC) add(F("SOC change"));
+  if (snapshot.batteryStatus & MAX17048_STATUS_RI) add(F("gauge reset"));
+  return alerts.length() ? alerts : String(F("none"));
 }
 
 
@@ -436,6 +537,8 @@ SensorSnapshot readBaseSensorSnapshot() {
 
   uint16_t rawVcell = 0;
   uint16_t rawSoc = 0;
+  uint16_t rawCrate = 0;
+  uint16_t rawStatus = 0;
   uint16_t version = 0;
   Wire.beginTransmission(MAX17048_I2C_ADDRESS);
   if (Wire.endTransmission() == 0 &&
@@ -456,6 +559,18 @@ SensorSnapshot readBaseSensorSnapshot() {
     if (voltage100mV < 0) voltage100mV = 0;
     if (voltage100mV > 255) voltage100mV = 255;
     snapshot.batteryVoltageZcl = static_cast<uint8_t>(voltage100mV);
+
+    if (readRegister16(MAX17048_REG_CRATE, rawCrate)) {
+      snapshot.batteryRateValid = true;
+      snapshot.batteryRatePercentPerHour =
+          static_cast<float>(static_cast<int16_t>(rawCrate)) *
+          MAX17048_CRATE_LSB_PERCENT_PER_HOUR;
+    }
+    if (readRegister16(MAX17048_REG_STATUS, rawStatus)) {
+      snapshot.batteryStatus = static_cast<uint8_t>(rawStatus >> 8);
+      snapshot.batteryResetDetected =
+          (snapshot.batteryStatus & MAX17048_STATUS_RI) != 0;
+    }
   }
 
   acknowledgeMax17048Alert();
@@ -1058,12 +1173,19 @@ void setup() {
   }
 
   if (snapshot.batteryValid) {
+    const BatteryAssessment batteryState = assessBattery(snapshot);
+    const String batteryAlerts = batteryAlertSummary(snapshot);
     Serial.printf(
-        "MAX17048: VERSION=0x%04X | %.3f V | raw SOC %.1f %% | Zigbee %u %% | INT was %s\n",
+        "MAX17048: VERSION=0x%04X | %.3f V | raw SOC %.1f %% | rounded %u %% | "
+        "rate %s%.2f %%/h | state %s | alerts %s | INT was %s\n",
         snapshot.maxVersion,
         snapshot.batteryVoltage,
         snapshot.batterySocRaw,
         snapshot.batteryPercent,
+        snapshot.batteryRateValid ? "" : "unavailable / ",
+        snapshot.batteryRateValid ? snapshot.batteryRatePercentPerHour : 0.0f,
+        batteryAssessmentName(batteryState),
+        batteryAlerts.c_str(),
         snapshot.maxIntLow ? "LOW" : "HIGH");
   } else {
     Serial.println("MAX17048: unavailable");
@@ -1082,11 +1204,30 @@ void setup() {
     skmCycleLogAppend("Water temperature: skipped for this wake");
   }
   if (snapshot.batteryValid) {
-    skmCycleLogAppend("MAX17048: %.3f V / raw SOC %.1f %% / rounded %u %% / INT %s",
-                      snapshot.batteryVoltage,
-                      snapshot.batterySocRaw,
-                      snapshot.batteryPercent,
-                      snapshot.maxIntLow ? "LOW" : "HIGH");
+    const BatteryAssessment batteryState = assessBattery(snapshot);
+    const String batteryAlerts = batteryAlertSummary(snapshot);
+    if (snapshot.batteryRateValid) {
+      skmCycleLogAppend(
+          "MAX17048: %.3f V / raw SOC %.1f %% / rounded %u %% / "
+          "rate %+.2f %%/h / state %s / alerts %s / INT %s",
+          snapshot.batteryVoltage,
+          snapshot.batterySocRaw,
+          snapshot.batteryPercent,
+          snapshot.batteryRatePercentPerHour,
+          batteryAssessmentName(batteryState),
+          batteryAlerts.c_str(),
+          snapshot.maxIntLow ? "LOW" : "HIGH");
+    } else {
+      skmCycleLogAppend(
+          "MAX17048: %.3f V / raw SOC %.1f %% / rounded %u %% / "
+          "rate unavailable / state %s / alerts %s / INT %s",
+          snapshot.batteryVoltage,
+          snapshot.batterySocRaw,
+          snapshot.batteryPercent,
+          batteryAssessmentName(batteryState),
+          batteryAlerts.c_str(),
+          snapshot.maxIntLow ? "LOW" : "HIGH");
+    }
   } else {
     skmCycleLogAppend("MAX17048: unavailable");
   }
