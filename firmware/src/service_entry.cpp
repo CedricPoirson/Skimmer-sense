@@ -71,7 +71,7 @@ String buildMax17048AdvancedHtml(const SensorSnapshot &snapshot) {
 
   String html;
   html.reserve(4300);
-  html += F("<details style='margin-top:18px'><summary style='cursor:pointer;font-weight:800;color:var(--cyan)'>Diagnostic avancé MAX17048</summary>");
+  html += F("<details id='max17048Details' style='margin-top:18px'><summary style='cursor:pointer;font-weight:800;color:var(--cyan)'>Diagnostic avancé MAX17048</summary>");
   html += F("<div class='info'>Lecture seule : aucun QuickStart, reset ou changement de configuration n’est effectué.</div><table>");
 
   appendMax17048RegisterRow(
@@ -217,7 +217,7 @@ String buildServiceHardwareHtml() {
 
     html += F("<div><span>Tension</span><b>");
     html += String(snapshot.batteryVoltage, 3);
-    html += F(" V</b></div><div><span>Évolution</span><b>");
+    html += F(" V</b></div><div><span>Tendance du gauge</span><b>");
     if (snapshot.batteryRateValid) {
       if (snapshot.batteryRatePercentPerHour >= 0.0f) html += '+';
       html += String(snapshot.batteryRatePercentPerHour, 2);
