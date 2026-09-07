@@ -82,7 +82,7 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.4-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.5-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -317,17 +317,23 @@ enum class BatteryAssessment : uint8_t {
 
 BatteryAssessment assessBattery(const SensorSnapshot &snapshot) {
   if (!snapshot.batteryValid) return BatteryAssessment::UNAVAILABLE;
-  if (snapshot.batteryPercent <= 10 || snapshot.batteryVoltage < 3.35f) {
+
+  // A truly low cell voltage remains authoritative, even while ModelGauge is
+  // learning. SOC-based alarms wait until the gauge rate becomes plausible.
+  if (snapshot.batteryVoltage < 3.35f) {
     return BatteryAssessment::CRITICAL;
-  }
-  if (snapshot.batteryPercent <= 20 || snapshot.batteryVoltage < 3.50f) {
-    return BatteryAssessment::LOW_LEVEL;
   }
 
   const float rate = snapshot.batteryRatePercentPerHour;
   if (snapshot.batteryResetDetected ||
       (snapshot.batteryRateValid && fabsf(rate) > 25.0f)) {
     return BatteryAssessment::STABILIZING;
+  }
+  if (snapshot.batteryPercent <= 10) {
+    return BatteryAssessment::CRITICAL;
+  }
+  if (snapshot.batteryPercent <= 20 || snapshot.batteryVoltage < 3.50f) {
+    return BatteryAssessment::LOW_LEVEL;
   }
   if (snapshot.batteryPercent >= 95 &&
       snapshot.batteryVoltage >= 4.10f &&
