@@ -82,7 +82,7 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.5-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.6-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -100,9 +100,13 @@ static constexpr uint8_t PIN_MAX17048_INT = 4;     // GPIO4 / MTMS -> ALRT/INT
 static constexpr uint8_t MAX17048_I2C_ADDRESS = 0x36;
 static constexpr uint8_t MAX17048_REG_VCELL = 0x02;
 static constexpr uint8_t MAX17048_REG_SOC = 0x04;
+static constexpr uint8_t MAX17048_REG_MODE = 0x06;
 static constexpr uint8_t MAX17048_REG_VERSION = 0x08;
+static constexpr uint8_t MAX17048_REG_HIBRT = 0x0A;
 static constexpr uint8_t MAX17048_REG_CONFIG = 0x0C;
+static constexpr uint8_t MAX17048_REG_VALRT = 0x14;
 static constexpr uint8_t MAX17048_REG_CRATE = 0x16;
+static constexpr uint8_t MAX17048_REG_VRESET_ID = 0x18;
 static constexpr uint8_t MAX17048_REG_STATUS = 0x1A;
 static constexpr uint16_t MAX17048_CONFIG_ALRT = 0x0020;
 static constexpr uint8_t MAX17048_STATUS_RI = 0x01;
