@@ -311,7 +311,7 @@ enum class BatteryAssessment : uint8_t {
   CHARGING,
   STABLE,
   DISCHARGING,
-  LOW,
+  LOW_LEVEL,
   CRITICAL,
 };
 
@@ -321,7 +321,7 @@ BatteryAssessment assessBattery(const SensorSnapshot &snapshot) {
     return BatteryAssessment::CRITICAL;
   }
   if (snapshot.batteryPercent <= 20 || snapshot.batteryVoltage < 3.50f) {
-    return BatteryAssessment::LOW;
+    return BatteryAssessment::LOW_LEVEL;
   }
 
   const float rate = snapshot.batteryRatePercentPerHour;
@@ -349,7 +349,7 @@ const char *batteryAssessmentName(BatteryAssessment assessment) {
     case BatteryAssessment::CHARGING: return "EN CHARGE";
     case BatteryAssessment::STABLE: return "STABLE";
     case BatteryAssessment::DISCHARGING: return "EN DECHARGE";
-    case BatteryAssessment::LOW: return "FAIBLE";
+    case BatteryAssessment::LOW_LEVEL: return "FAIBLE";
     case BatteryAssessment::CRITICAL: return "CRITIQUE";
     default: return "INDISPONIBLE";
   }
