@@ -38,7 +38,7 @@ String buildServiceHardwareHtml() {
     if (assessment == BatteryAssessment::FULL ||
         assessment == BatteryAssessment::CHARGING) {
       tone = "good";
-    } else if (assessment == BatteryAssessment::LOW ||
+    } else if (assessment == BatteryAssessment::LOW_LEVEL ||
                assessment == BatteryAssessment::STABILIZING) {
       tone = "warning";
     } else if (assessment == BatteryAssessment::CRITICAL) {
