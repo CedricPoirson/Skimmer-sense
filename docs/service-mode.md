@@ -235,3 +235,17 @@ Do not use `pio run -t erase` as part of normal updating, because that would era
 ## Battery note
 
 SERVICE mode keeps the ESP32-C6 awake with Wi-Fi enabled. AP+STA and the web server consume far more power than normal deep sleep. SERVICE mode is intended for short maintenance sessions only.
+
+
+## Tableau de bord dynamique (v0.9.3)
+
+L'interface SERVICE est une application Web autonome servie directement par le XIAO, sans CDN ni connexion Internet. La page principale ne se recharge plus :
+
+- mesures matérielles, RSSI Wi-Fi, mémoire libre et temps de session actualisés toutes les 5 secondes ;
+- état RTC, diagnostics et historique des resets actualisés automatiquement ;
+- activation et annulation de la capture de 50 réveils sans changement de page ;
+- logs actualisés toutes les 2 secondes avec défilement intelligent ;
+- OTA asynchrone avec barre de progression, message de résultat et bouton de redémarrage ;
+- présentation responsive adaptée au téléphone, à la tablette et à l'ordinateur.
+
+L'API locale `GET /api/status` fournit les fragments de diagnostic et les métriques au format JSON. `GET /logs.txt` reste disponible pour une consultation ou une intégration simple.
