@@ -270,6 +270,25 @@ String diagnosticsHtml() {
   return html;
 }
 
+String jsonEscape(const String &value) {
+  String escaped;
+  escaped.reserve(value.length() + 32);
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value[i];
+    switch (c) {
+      case '\\': escaped += F("\\\\"); break;
+      case '"': escaped += F("\\\""); break;
+      case '\n': escaped += F("\\n"); break;
+      case '\r': escaped += F("\\r"); break;
+      case '\t': escaped += F("\\t"); break;
+      default:
+        if (static_cast<uint8_t>(c) >= 0x20) escaped += c;
+        break;
+    }
+  }
+  return escaped;
+}
+
 String pageHeader(const char *firmwareVersion,
                   const char *firmwareFlavor,
                   const String &apSsid,
@@ -281,37 +300,62 @@ String pageHeader(const char *firmwareVersion,
                   const IPAddress &staIp,
                   bool mdnsOk) {
   String html;
-  html.reserve(3400);
-  html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
-  html += F("<title>SkimmerSense Service</title><style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:900px;margin:auto;padding:18px;background:#f4f6f8;color:#17202a}h1{margin-bottom:4px}h2{margin-top:28px}table{border-collapse:collapse;width:100%;background:white}th,td{border:1px solid #d8dde3;padding:7px;text-align:left}th{background:#eef2f5}code{background:#e8edf1;padding:2px 5px;border-radius:4px}.card{background:white;padding:14px;border-radius:10px;margin:12px 0}.warn{background:#fff4d6;padding:12px;border-radius:8px}.ok{background:#e7f6e7;padding:12px;border-radius:8px}button,input[type=submit]{font-size:16px;padding:9px 14px}</style></head><body>");
-  html += F("<h1>SkimmerSense Service</h1><p>Firmware <strong>");
-  html += firmwareVersion; html += F("</strong> — "); html += firmwareFlavor; html += F("</p>");
-
-  html += F("<div class='card'><strong>Fallback maintenance AP</strong><br>SSID: <code>");
-  html += apSsid; html += F("</code><br>Password: <code>"); html += apPassword;
-  html += F("</code><br>Address: <code>http://"); html += apIp.toString(); html += F("/</code></div>");
-
-  html += F("<div class='card'><strong>Home Wi-Fi</strong><br>");
-  if (!homeConfigured) {
-    html += F("Not configured. Create <code>firmware/include/wifi_secrets.h</code> from the example file.");
+  html.reserve(10500);
+  html += F(R"HTML(<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#071b2b"><title>SkimmerSense Service</title>
+<style>
+:root{--bg:#06131f;--panel:#0d2233;--panel2:#102b40;--line:#21445b;--text:#effaff;--muted:#8fb0c4;--cyan:#28c5e5;--blue:#2794ff;--green:#3ddc97;--amber:#ffbf57;--red:#ff6b79;--shadow:0 18px 50px rgba(0,0,0,.25)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:radial-gradient(circle at 85% 0,#103a55 0,transparent 33%),var(--bg);color:var(--text);min-height:100vh}
+a{color:var(--cyan);text-decoration:none}a:hover{text-decoration:underline}.shell{width:min(1120px,calc(100% - 28px));margin:auto}.top{position:sticky;top:0;z-index:10;background:rgba(6,19,31,.82);backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.08)}
+.topin{height:64px;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:11px;font-weight:750}.logo{width:34px;height:34px;border-radius:11px;background:linear-gradient(135deg,var(--cyan),var(--blue));display:grid;place-items:center;box-shadow:0 0 24px rgba(40,197,229,.35)}.logo:after{content:"~";font-size:25px;font-weight:800}
+.live{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}.dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 5px rgba(61,220,151,.12);animation:pulse 2s infinite}@keyframes pulse{50%{opacity:.45}}
+.hero{padding:34px 0 22px}.hero h1{margin:0;font-size:clamp(29px,5vw,45px);letter-spacing:-.04em}.hero p{color:var(--muted);margin:9px 0 0}.badge{display:inline-flex;padding:5px 10px;border-radius:999px;background:rgba(40,197,229,.12);color:var(--cyan);border:1px solid rgba(40,197,229,.25);font-size:12px;font-weight:700}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{grid-column:span 6;background:linear-gradient(145deg,rgba(16,43,64,.95),rgba(11,31,47,.95));border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:18px;box-shadow:var(--shadow)}.card.full{grid-column:1/-1}.card.third{grid-column:span 4}.card h2,.card h3{margin:0 0 13px}.eyebrow{text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-size:11px;font-weight:800}.value{font-size:22px;font-weight:760;margin-top:6px}.sub{color:var(--muted);font-size:13px;line-height:1.5}.status{display:inline-flex;align-items:center;gap:7px;color:var(--green);font-weight:700}.status:before{content:"";width:8px;height:8px;background:currentColor;border-radius:50%}
+section{margin:0 0 20px}.section-title{display:flex;align-items:end;justify-content:space-between;margin:28px 2px 12px}.section-title h2{margin:0}.section-title small{color:var(--muted)}
+table{border-collapse:separate;border-spacing:0;width:100%;background:transparent;overflow:hidden}th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:14px}th{color:var(--muted);font-weight:650}tr:last-child th,tr:last-child td{border-bottom:0}code{background:#071724;padding:3px 6px;border-radius:6px;color:#bceeff;overflow-wrap:anywhere}
+button,.button,input[type=submit]{appearance:none;border:0;border-radius:11px;padding:11px 15px;background:linear-gradient(135deg,var(--cyan),var(--blue));color:#04141f;font:inherit;font-weight:760;cursor:pointer;transition:.18s transform,.18s opacity;display:inline-flex;align-items:center;justify-content:center;gap:7px}button:hover,.button:hover{transform:translateY(-1px);text-decoration:none}button:disabled{opacity:.45;cursor:wait;transform:none}.secondary{background:#183a51;color:var(--text);border:1px solid var(--line)}.danger{background:rgba(255,107,121,.15);color:#ffadb6;border:1px solid rgba(255,107,121,.35)}
+.actions{display:flex;gap:9px;flex-wrap:wrap}.warn,.ok,.info{padding:12px 14px;border-radius:12px;margin:12px 0}.warn{background:rgba(255,191,87,.12);border:1px solid rgba(255,191,87,.28);color:#ffd995}.ok{background:rgba(61,220,151,.11);border:1px solid rgba(61,220,151,.25);color:#9cf0c8}.info{background:rgba(39,148,255,.11);border:1px solid rgba(39,148,255,.25)}
+.metricbar{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:12px 0}.metric{background:rgba(2,13,22,.35);padding:12px;border-radius:12px}.metric b{display:block;font-size:19px;margin-top:4px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#031018;color:#b8fbd7;padding:16px;border-radius:14px;min-height:310px;max-height:68vh;overflow:auto;border:1px solid #173b4b;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
+.filebox{border:1px dashed #3b6680;border-radius:13px;padding:16px;background:rgba(0,0,0,.12)}input[type=file]{max-width:100%;color:var(--muted)}progress{width:100%;height:12px;accent-color:var(--cyan);margin-top:12px}.hidden{display:none!important}.skeleton{height:95px;border-radius:12px;background:linear-gradient(90deg,#112b3d 25%,#193c51 50%,#112b3d 75%);background-size:200% 100%;animation:shine 1.5s infinite}@keyframes shine{to{background-position:-200% 0}}
+.toast{position:fixed;right:18px;bottom:18px;z-index:30;max-width:min(390px,calc(100% - 36px));padding:13px 16px;border-radius:12px;background:#17394d;border:1px solid #2c5971;box-shadow:var(--shadow);transform:translateY(120px);opacity:0;transition:.25s}.toast.show{transform:none;opacity:1}.toast.error{border-color:var(--red);color:#ffc0c6}
+footer{color:var(--muted);font-size:12px;padding:20px 0 35px;text-align:center}
+@media(max-width:760px){.card,.card.third{grid-column:1/-1}.metricbar{grid-template-columns:1fr}.topin{height:58px}.hero{padding-top:25px}.section-title{align-items:start;flex-direction:column;gap:4px}table{display:block;overflow-x:auto}}
+</style></head><body><header class="top"><div class="shell topin"><div class="brand"><span class="logo"></span>SkimmerSense</div><div class="live"><span class="dot"></span><span id="liveLabel">SERVICE en ligne</span></div></div></header><main class="shell">
+<div class="hero"><span class="badge">MODE MAINTENANCE</span><h1>Tableau de bord</h1><p>Diagnostic, historique et mise à jour locale de votre capteur de piscine.</p></div>
+<div class="grid">)HTML");
+  html += F("<div class='card third'><div class='eyebrow'>Firmware</div><div class='value'>");
+  html += firmwareVersion; html += F("</div><div class='sub'>"); html += firmwareFlavor; html += F("</div></div>");
+  html += F("<div class='card third'><div class='eyebrow'>Wi-Fi maison</div>");
+  if (staConnected) {
+    html += F("<div class='value status'>Connecté</div><div class='sub'>");
+    html += homeSsid; html += F(" · "); html += staIp.toString(); html += F("<br>");
+    html += mdnsOk ? F("skimmersense.local") : F("mDNS indisponible");
+    html += F("</div>");
   } else {
-    html += F("SSID: <code>"); html += homeSsid; html += F("</code><br>Status: ");
-    if (staConnected) {
-      html += F("<strong>connected</strong><br>LAN address: <code>http://");
-      html += staIp.toString(); html += F("/</code><br>mDNS: ");
-      if (mdnsOk) html += F("<code>http://skimmersense.local/</code>");
-      else html += F("unavailable; use the LAN IP above");
-    } else {
-      html += F("<strong>not connected</strong>. The fallback AP remains available.");
-    }
+    html += F("<div class='value' style='color:var(--amber)'>Non connecté</div><div class='sub'>");
+    html += homeConfigured ? homeSsid : String(F("Non configuré"));
+    html += F("</div>");
   }
-  html += F("</div>");
+  html += F("</div><div class='card third'><div class='eyebrow'>Point d’accès secours</div><div class='value'>");
+  html += apSsid; html += F("</div><div class='sub'>"); html += apIp.toString();
+  html += F(" · mot de passe <code>"); html += apPassword; html += F("</code></div></div></div>");
   return html;
 }
 
-String pageFooter() { return F("</body></html>"); }
+String pageFooter() {
+  return F(R"HTML(<footer>SkimmerSense · interface locale autonome</footer></main>
+<div id="toast" class="toast"></div>
+<script>
+const $=id=>document.getElementById(id);
+function toast(message,error=false){const t=$('toast');if(!t)return;t.textContent=message;t.className='toast show'+(error?' error':'');clearTimeout(window._toastTimer);window._toastTimer=setTimeout(()=>t.className='toast',4200)}
+function formatUptime(seconds){seconds=Number(seconds)||0;const d=Math.floor(seconds/86400),h=Math.floor(seconds%86400/3600),m=Math.floor(seconds%3600/60);return(d?d+' j ':'')+(h?h+' h ':'')+m+' min'}
+async function postAction(url,success){try{const r=await fetch(url+'?ajax=1',{method:'POST',cache:'no-store'});let d={};try{d=await r.json()}catch(e){}if(!r.ok||d.ok===false)throw new Error(d.message||'Action refusée');toast(d.message||success);if(window.refreshDashboard)setTimeout(window.refreshDashboard,350)}catch(e){toast(e.message||String(e),true)}}
+</script></body></html>)HTML");
+}
 
-}  // namespace
+}  // namespace}  // namespace
 
 void skmCycleLogBegin() {
   retainedCycleLog.magic = CYCLE_LOG_MAGIC;
@@ -706,10 +750,16 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
     appendServiceSessionLine(
         armed ? String(F("Next 50 production wakes capture ARMED"))
               : String(F("FAILED to arm production scenario capture")));
-    server.sendHeader("Location", "/", true);
-    server.send(armed ? 303 : 500,
-                "text/plain; charset=utf-8",
-                armed ? "Capture armed" : "Unable to arm capture");
+    if (server.hasArg("ajax")) {
+      server.send(armed ? 200 : 500, "application/json; charset=utf-8",
+                  armed
+                    ? "{\"ok\":true,\"message\":\"Capture de 50 réveils activée\"}"
+                    : "{\"ok\":false,\"message\":\"Impossible d’activer la capture\"}");
+    } else {
+      server.sendHeader("Location", "/", true);
+      server.send(armed ? 303 : 500, "text/plain; charset=utf-8",
+                  armed ? "Capture armed" : "Unable to arm capture");
+    }
   });
 
   server.on("/capture-cancel", HTTP_POST, [&]() {
@@ -717,8 +767,15 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
     appendServiceSessionLine(
         cancelled ? String(F("Fifty-wake capture cancelled"))
                   : String(F("Fifty-wake capture was already inactive")));
-    server.sendHeader("Location", "/", true);
-    server.send(303, "text/plain; charset=utf-8", "Capture cancelled");
+    if (server.hasArg("ajax")) {
+      server.send(200, "application/json; charset=utf-8",
+                  cancelled
+                    ? "{\"ok\":true,\"message\":\"Capture annulée\"}"
+                    : "{\"ok\":true,\"message\":\"La capture était déjà inactive\"}");
+    } else {
+      server.sendHeader("Location", "/", true);
+      server.send(303, "text/plain; charset=utf-8", "Capture cancelled");
+    }
   });
 
   server.on("/logs.txt", HTTP_GET, [&]() {
@@ -735,83 +792,120 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
 
   server.on("/logs", HTTP_GET, [&]() {
     String html = makeHeader();
-    html += F("<h2>Wi-Fi logs</h2><div class='card'>"
-              "<p>The last production cycle is retained without flash writes. "
-              "This SERVICE session refreshes every two seconds.</p>"
-              "<p><a href='/'>Back to diagnostics</a> | "
-              "<a href='/logs-download'>Download logs</a></p>"
-              "<pre id='log' style='white-space:pre-wrap;overflow-wrap:anywhere;"
-              "background:#111;color:#d9f2d9;padding:12px;border-radius:8px;"
-              "min-height:280px'>Loading...</pre></div>"
-              "<script>async function r(){try{const x=await fetch('/logs.txt',"
-              "{cache:'no-store'});document.getElementById('log').textContent="
-              "await x.text();}catch(e){document.getElementById('log').textContent="
-              "='Log refresh failed: '+e;}}r();setInterval(r,2000);</script>");
+    html += F(R"HTML(
+<section><div class="section-title"><div><h2>Journaux en direct</h2><small>Mise à jour automatique toutes les deux secondes</small></div><div class="actions"><a class="button secondary" href="/">Retour</a><a class="button" href="/logs-download">Télécharger</a></div></div>
+<div class="card full"><div class="live" style="margin-bottom:10px"><span class="dot"></span><span id="logState">Connexion aux journaux…</span></div><pre id="log">Chargement…</pre></div></section>
+<script>
+let firstLog=true;
+async function refreshLogs(){try{const r=await fetch('/logs.txt',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const text=await r.text(),box=$('log');const nearBottom=box.scrollHeight-box.scrollTop-box.clientHeight<70;box.textContent=text;$('logState').textContent='Dernière mise à jour : '+new Date().toLocaleTimeString();if(firstLog||nearBottom)box.scrollTop=box.scrollHeight;firstLog=false}catch(e){$('logState').textContent='Connexion interrompue';toast('Actualisation des logs impossible',true)}}
+refreshLogs();setInterval(refreshLogs,2000);
+</script>)HTML");
     html += pageFooter();
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html; charset=utf-8", html);
   });
 
+  server.on("/api/status", HTTP_GET, [&]() {
+    const String hardware =
+        statusProvider != nullptr
+          ? statusProvider()
+          : String(F("<p class='warn'>Mesures matérielles indisponibles.</p>"));
+    const String diagnostics = diagnosticsHtml();
+    const String resets = resetLogHtml();
+    String json;
+    json.reserve(hardware.length() + diagnostics.length() + resets.length() + 320);
+    json += F("{\"hardware\":\""); json += jsonEscape(hardware);
+    json += F("\",\"diagnostics\":\""); json += jsonEscape(diagnostics);
+    json += F("\",\"resets\":\""); json += jsonEscape(resets);
+    json += F("\",\"capture_active\":");
+    json += skmCycleCaptureRequested() ? F("true") : F("false");
+    json += F(",\"capture_remaining\":");
+    json += String(skmCycleCaptureRemaining());
+    json += F(",\"heap\":"); json += String(ESP.getFreeHeap());
+    json += F(",\"uptime\":"); json += String(millis() / 1000UL);
+    json += F(",\"wifi_connected\":");
+    json += WiFi.status() == WL_CONNECTED ? F("true") : F("false");
+    json += F(",\"wifi_rssi\":");
+    json += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) : String(0);
+    json += F("}");
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json; charset=utf-8", json);
+  });
+
   server.on("/", HTTP_GET, [&]() {
     String html = makeHeader();
     if (!apOk) {
-      html += F("<p class='warn'><strong>Fallback AP failed to start.</strong></p>");
+      html += F("<p class='warn'><strong>Le point d’accès de secours n’a pas démarré.</strong></p>");
     }
-    if (statusProvider != nullptr) {
-      html += F("<h2>Live hardware</h2>");
-      html += statusProvider();
-    }
-    html += diagnosticsHtml();
-    html += resetLogHtml();
-    html += F("<h2>Production-cycle capture</h2><div class='card'>");
-    if (skmCycleCaptureRequested()) {
-      html += F("<p class='ok'><strong>ARMED:</strong> capturing successive "
-                "production wakes until return to NORMAL (maximum eight). "
-                "Remaining limit: ");
-      html += String(skmCycleCaptureRemaining());
-      html += F(".</p><form method='POST' action='/capture-cancel'>"
-                "<button type='submit'>Cancel scenario capture</button></form>");
-    } else {
-      html += F("<p>Capture a complete multi-wake state-machine scenario across "
-                "RESET without continuous flash writes.</p>"
-                "<form method='POST' action='/capture-next'>"
-                "<button type='submit'>Capture next 50 wakes</button></form>");
-    }
-    html += F("</div>");
-    html += F("<h2>Logs</h2><div class='card'><p>"
-              "<a href='/logs'>Open live Wi-Fi logs</a> | "
-              "<a href='/logs-download'>Download logs</a></p>"
-              "<p>Includes the retained last production cycle, persistent scenario and current "
-              "SERVICE session.</p></div>");
-    html += F("<h2>OTA firmware update</h2><div class='card'><p>Upload a PlatformIO <code>firmware.bin</code>. The inactive OTA application slot is written; Zigbee storage is not intentionally erased.</p>");
-    html += F("<p class='warn'><strong>After a successful upload:</strong> remove the D6-GND SERVICE jumper before rebooting if you want normal production mode.</p>");
-    html += F("<form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required> <input type='submit' value='Upload firmware'></form></div>");
-    html += F("<h2>Restart</h2><div class='card'><form method='POST' action='/reboot'><button type='submit'>Reboot SkimmerSense</button></form></div>");
+    html += F(R"HTML(
+<section><div class="section-title"><div><h2>État en direct</h2><small>Actualisation automatique · aucun rechargement nécessaire</small></div></div>
+<div class="metricbar"><div class="metric"><span class="eyebrow">Wi-Fi RSSI</span><b id="rssi">—</b></div><div class="metric"><span class="eyebrow">Mémoire libre</span><b id="heap">—</b></div><div class="metric"><span class="eyebrow">Session SERVICE</span><b id="uptime">—</b></div></div>
+<div id="hardware" class="card full"><div class="skeleton"></div></div></section>
+<section><div class="section-title"><div><h2>Diagnostic</h2><small>État RTC et dernier parcours du firmware</small></div></div><div id="diagnostics" class="card full"><div class="skeleton"></div></div></section>
+<section><div class="section-title"><div><h2>Historique des redémarrages</h2><small>Conservé pour identifier watchdog, brownout et crash</small></div></div><div id="resets" class="card full"><div class="skeleton"></div></div></section>
+<section><div class="section-title"><div><h2>Capture de scénario</h2><small>Jusqu’à 50 réveils de production</small></div></div><div id="capture" class="card full"><div class="skeleton"></div></div></section>
+<section><div class="section-title"><div><h2>Journaux</h2><small>Cycles Zigbee, décisions et mesures</small></div></div><div class="card full"><div class="actions"><a class="button" href="/logs">Ouvrir les logs en direct</a><a class="button secondary" href="/logs-download">Télécharger</a></div></div></section>
+<section><div class="section-title"><div><h2>Mise à jour OTA</h2><small>Écriture sécurisée dans le slot applicatif inactif</small></div></div><div class="card full">
+<div class="warn"><strong>Après une mise à jour réussie :</strong> retire le jumper SERVICE D6–GND avant de redémarrer pour revenir en production.</div>
+<form id="otaForm" class="filebox"><input id="firmwareFile" type="file" name="firmware" accept=".bin" required><div class="actions" style="margin-top:13px"><button id="otaButton" type="submit">Installer le firmware</button></div><progress id="otaProgress" class="hidden" value="0" max="100"></progress><div id="otaText" class="sub" style="margin-top:8px"></div></form>
+</div></section>
+<section><div class="section-title"><div><h2>Redémarrage</h2><small>Le mode sélectionné dépend de la position du jumper</small></div></div><div class="card full"><button class="danger" onclick="rebootDevice()">Redémarrer SkimmerSense</button></div></section>
+<script>
+let statusBusy=false;
+window.refreshDashboard=async function(){if(statusBusy)return;statusBusy=true;try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();$('hardware').innerHTML=d.hardware;$('diagnostics').innerHTML=d.diagnostics;$('resets').innerHTML=d.resets;$('rssi').textContent=d.wifi_connected?d.wifi_rssi+' dBm':'hors ligne';$('heap').textContent=Math.round(d.heap/1024)+' Ko';$('uptime').textContent=formatUptime(d.uptime);$('liveLabel').textContent='Mis à jour à '+new Date().toLocaleTimeString();$('capture').innerHTML=d.capture_active?'<div class="ok"><strong>Capture active</strong> · '+d.capture_remaining+' réveil(s) restant(s)</div><button class="secondary" onclick="postAction(\'/capture-cancel\',\'Capture annulée\')">Annuler la capture</button>':'<p class="sub">Enregistre les prochains réveils de production afin de reconstituer un scénario complet, même après plusieurs passages en veille.</p><button onclick="postAction(\'/capture-next\',\'Capture activée\')">Capturer les 50 prochains réveils</button>';}catch(e){$('liveLabel').textContent='Connexion interrompue';toast('Tableau de bord momentanément inaccessible',true)}finally{statusBusy=false}}
+function uploadFirmware(event){event.preventDefault();const file=$('firmwareFile').files[0];if(!file){toast('Sélectionne un fichier firmware.bin',true);return}if(!file.name.toLowerCase().endsWith('.bin')){toast('Le fichier doit être au format .bin',true);return}const form=new FormData();form.append('firmware',file);const xhr=new XMLHttpRequest(),bar=$('otaProgress'),button=$('otaButton'),label=$('otaText');button.disabled=true;bar.classList.remove('hidden');bar.value=0;label.textContent='Préparation de l’envoi…';xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded*100/e.total);bar.value=p;label.textContent='Téléversement : '+p+' %'}};xhr.onload=()=>{button.disabled=false;let d={};try{d=JSON.parse(xhr.responseText)}catch(e){}if(xhr.status>=200&&xhr.status<300&&d.ok!==false){bar.value=100;label.innerHTML='<span class="ok" style="display:block">Firmware installé. Retire maintenant le jumper SERVICE, puis redémarre.</span><button type="button" class="danger" onclick="rebootDevice()">Redémarrer</button>';toast(d.message||'Mise à jour OTA réussie')}else{label.textContent=d.message||'Échec de la mise à jour OTA';toast(label.textContent,true)}};xhr.onerror=()=>{button.disabled=false;label.textContent='Connexion interrompue pendant l’OTA';toast(label.textContent,true)};xhr.open('POST','/update?ajax=1');xhr.send(form)}
+async function rebootDevice(){toast('Redémarrage en cours…');try{await fetch('/reboot?ajax=1',{method:'POST'})}catch(e){}setTimeout(()=>{$('liveLabel').textContent='Redémarrage…'},300)}
+$('otaForm').addEventListener('submit',uploadFirmware);refreshDashboard();setInterval(refreshDashboard,5000);
+</script>)HTML");
     html += pageFooter();
+    server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html; charset=utf-8", html);
   });
 
   server.on("/reboot", HTTP_POST, [&]() {
     appendServiceSessionLine(String(F("Software reboot requested from web page")));
-    server.send(200, "text/html; charset=utf-8", "<html><body><h2>Rebooting...</h2></body></html>");
-    delay(300);
+    if (server.hasArg("ajax")) {
+      server.send(200, "application/json; charset=utf-8",
+                  "{\"ok\":true,\"message\":\"Redémarrage en cours\"}");
+    } else {
+      server.send(200, "text/html; charset=utf-8",
+                  "<html><body><h2>Redémarrage…</h2></body></html>");
+    }
+    delay(400);
     ESP.restart();
   });
 
   server.on(
       "/update", HTTP_POST,
       [&]() {
-        String html = makeHeader();
-        if (otaFinishedOk && !Update.hasError()) {
-          html += F("<h2>OTA upload successful</h2><p>The new firmware is stored in the alternate OTA slot.</p><p class='warn'><strong>Remove the D6-GND SERVICE jumper now</strong>, then reboot to return to normal operation.</p><form method='POST' action='/reboot'><button type='submit'>Reboot into new firmware</button></form>");
+        if (server.hasArg("ajax")) {
+          String json;
+          if (otaFinishedOk && !Update.hasError()) {
+            json = F("{\"ok\":true,\"message\":\"Mise à jour OTA terminée\"}");
+            server.sendHeader("Connection", "close");
+            server.send(200, "application/json; charset=utf-8", json);
+          } else {
+            json = F("{\"ok\":false,\"message\":\"");
+            json += jsonEscape(otaFailure.length()
+                                 ? otaFailure
+                                 : String(F("La bibliothèque OTA a signalé une erreur.")));
+            json += F("\"}");
+            server.sendHeader("Connection", "close");
+            server.send(500, "application/json; charset=utf-8", json);
+          }
         } else {
-          html += F("<h2>OTA upload failed</h2><p>");
-          html += otaFailure.length() ? otaFailure : String("Update library reported an error.");
-          html += F("</p><p><a href='/'>Back to service page</a></p>");
+          String html = makeHeader();
+          if (otaFinishedOk && !Update.hasError()) {
+            html += F("<section><div class='card full'><h2>Mise à jour OTA réussie</h2><div class='warn'><strong>Retire le jumper SERVICE D6–GND</strong>, puis redémarre pour revenir en production.</div><form method='POST' action='/reboot'><button type='submit'>Redémarrer</button></form></div></section>");
+          } else {
+            html += F("<section><div class='card full'><h2>Échec de la mise à jour OTA</h2><p>");
+            html += otaFailure.length() ? otaFailure : String(F("La bibliothèque OTA a signalé une erreur."));
+            html += F("</p><a class='button secondary' href='/'>Retour</a></div></section>");
+          }
+          html += pageFooter();
+          server.sendHeader("Connection", "close");
+          server.send(200, "text/html; charset=utf-8", html);
         }
-        html += pageFooter();
-        server.sendHeader("Connection", "close");
-        server.send(200, "text/html; charset=utf-8", html);
       },
       [&]() {
         HTTPUpload &upload = server.upload();
