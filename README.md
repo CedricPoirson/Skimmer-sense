@@ -46,11 +46,11 @@ The result is a local, cloud-free refill system with physical hysteresis, wave r
 - **Automation:** Home Assistant controlling an IPX800 V4 dry-contact relay
 - **Power:** protected 1S 18650 battery with deep sleep
 - **Maintenance:** D6/GPIO16 jumper, Wi-Fi portal, downloadable diagnostics and OTA
-- **Current firmware:** v0.9.13 production candidate
+- **Current firmware:** v0.9.14 production candidate
 
 ## Current status
 
-Firmware **v0.9.13** is a production candidate. The established sensing, Zigbee and deep-sleep paths are hardware-validated; the reinforced battery telemetry and cold-boot interview window still require validation on the current prototype. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
+Firmware **v0.9.14** is a production candidate. The established sensing, Zigbee and deep-sleep paths are hardware-validated; the reinforced battery telemetry and fast-poll cold-boot interview window still require validation on the current prototype. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
 
 Validated on the current XIAO ESP32-C6 prototype:
 

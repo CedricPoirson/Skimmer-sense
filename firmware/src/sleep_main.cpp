@@ -120,11 +120,19 @@ static_assert(SKIMMERSENSE_BATTERY_REPORT_COPIES >= 1U &&
 #define SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS 30000UL
 #endif
 
+#ifndef SKIMMERSENSE_ZIGBEE_INTERVIEW_POLL_MS
+#define SKIMMERSENSE_ZIGBEE_INTERVIEW_POLL_MS 500UL
+#endif
+
+#ifndef SKIMMERSENSE_ZIGBEE_NORMAL_POLL_MS
+#define SKIMMERSENSE_ZIGBEE_NORMAL_POLL_MS 10000UL
+#endif
+
 #include "Zigbee.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.13-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.14-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -822,14 +830,25 @@ void scheduleZigbeeRecovery(CyclePlan &plan, const char *failureStage) {
       static_cast<unsigned long long>(plannedSleepSeconds));
 }
 
-bool startZigbee() {
+bool startZigbee(bool fastPollForInterview) {
   esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
 
   // Adaptive NORMAL sleep can reach 6 hours. Keep the Zigbee child
   // relationship alive much longer than the default sleepy-device timeout.
   zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout =
       ESP_ZB_ED_AGING_TIMEOUT_2048MIN;
-  zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 10000;
+  zigbeeConfig.nwk_cfg.zed_cfg.keep_alive =
+      fastPollForInterview
+          ? SKIMMERSENSE_ZIGBEE_INTERVIEW_POLL_MS
+          : SKIMMERSENSE_ZIGBEE_NORMAL_POLL_MS;
+  Serial.printf("Zigbee sleepy poll interval: %lu ms%s\n",
+                static_cast<unsigned long>(
+                    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive),
+                fastPollForInterview ? " (cold-boot interview)" : "");
+  skmCycleLogAppend("Zigbee sleepy poll interval: %lu ms%s",
+                    static_cast<unsigned long>(
+                        zigbeeConfig.nwk_cfg.zed_cfg.keep_alive),
+                    fastPollForInterview ? " (cold-boot interview)" : "");
   Zigbee.setTimeout(SKIMMERSENSE_ZIGBEE_BEGIN_TIMEOUT_MS);
 
   const uint32_t primaryChannelMask = 1UL << SKIMMERSENSE_ZIGBEE_CHANNEL;
@@ -1406,7 +1425,7 @@ void setup() {
       plan.useZigbee = false;
       plan.reportTemperature = false;
       plan.reportFloats = false;
-    } else if (!startZigbee()) {
+    } else if (!startZigbee(cause == ESP_SLEEP_WAKEUP_UNDEFINED)) {
       scheduleZigbeeRecovery(plan, "startup/reconnection failure");
       plan.useZigbee = false;
       plan.reportTemperature = false;
