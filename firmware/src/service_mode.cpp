@@ -321,6 +321,7 @@ button,.button,input[type=submit]{appearance:none;border:0;border-radius:11px;pa
 pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#031018;color:#b8fbd7;padding:16px;border-radius:14px;min-height:310px;max-height:68vh;overflow:auto;border:1px solid #173b4b;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
 .filebox{border:1px dashed #3b6680;border-radius:13px;padding:16px;background:rgba(0,0,0,.12)}input[type=file]{max-width:100%;color:var(--muted)}progress{width:100%;height:12px;accent-color:var(--cyan);margin-top:12px}.hidden{display:none!important}.skeleton{height:95px;border-radius:12px;background:linear-gradient(90deg,#112b3d 25%,#193c51 50%,#112b3d 75%);background-size:200% 100%;animation:shine 1.5s infinite}@keyframes shine{to{background-position:-200% 0}}
 .toast{position:fixed;right:18px;bottom:18px;z-index:30;max-width:min(390px,calc(100% - 36px));padding:13px 16px;border-radius:12px;background:#17394d;border:1px solid #2c5971;box-shadow:var(--shadow);transform:translateY(120px);opacity:0;transition:.25s}.toast.show{transform:none;opacity:1}.toast.error{border-color:var(--red);color:#ffc0c6}
+.restart-overlay{position:fixed;inset:0;z-index:50;display:none;place-items:center;padding:22px;background:rgba(3,13,22,.88);backdrop-filter:blur(14px)}.restart-overlay.show{display:grid}.restart-card{width:min(520px,100%);padding:25px;border-radius:20px;background:linear-gradient(145deg,var(--panel2),var(--panel));border:1px solid var(--line);box-shadow:var(--shadow);text-align:center}.restart-card h2{margin:12px 0 8px}.restart-card p{color:var(--muted);line-height:1.5}.spinner{width:42px;height:42px;margin:auto;border:4px solid rgba(40,197,229,.18);border-top-color:var(--cyan);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 footer{color:var(--muted);font-size:12px;padding:20px 0 35px;text-align:center}
 @media(max-width:760px){.card,.card.third{grid-column:1/-1}.metricbar{grid-template-columns:1fr}.batteryfacts{grid-template-columns:repeat(2,1fr)}.batteryhead>strong{font-size:29px}.topin{height:58px}.hero{padding-top:25px}.section-title{align-items:start;flex-direction:column;gap:4px}table{display:block;overflow-x:auto}}
 </style></head><body><header class="top"><div class="shell topin"><div class="brand"><span class="logo"></span>SkimmerSense</div><div class="live"><span class="dot"></span><span id="liveLabel">SERVICE en ligne</span></div></div></header><main class="shell">
@@ -343,11 +344,16 @@ footer{color:var(--muted);font-size:12px;padding:20px 0 35px;text-align:center}
   html += apSsid; html += F("</div><div class='sub'>"); html += apIp.toString();
   html += F(" · mot de passe <code>"); html += apPassword; html += F("</code></div></div></div>");
   html += F(R"HTML(<div id="toast" class="toast"></div>
+<div id="restartOverlay" class="restart-overlay"><div class="restart-card"><div class="spinner"></div><h2 id="restartTitle">Redémarrage…</h2><p id="restartText">SkimmerSense redémarre. Reconnexion automatique en cours.</p><button id="restartReload" class="secondary hidden" onclick="location.reload()">Réessayer maintenant</button></div></div>
 <script>
 const $=id=>document.getElementById(id);
+let restarting=false;
 function toast(message,error=false){const t=$('toast');if(!t)return;t.textContent=message;t.className='toast show'+(error?' error':'');clearTimeout(window._toastTimer);window._toastTimer=setTimeout(()=>t.className='toast',4200)}
 function formatUptime(seconds){seconds=Number(seconds)||0;const d=Math.floor(seconds/86400),h=Math.floor(seconds%86400/3600),m=Math.floor(seconds%3600/60);return(d?d+' j ':'')+(h?h+' h ':'')+m+' min'}
 async function postAction(url,success){try{const r=await fetch(url+'?ajax=1',{method:'POST',cache:'no-store'});let d={};try{d=await r.json()}catch(e){}if(!r.ok||d.ok===false)throw new Error(d.message||'Action refusée');toast(d.message||success);if(window.refreshDashboard)setTimeout(window.refreshDashboard,350)}catch(e){toast(e.message||String(e),true)}}
+function delayMs(ms){return new Promise(resolve=>setTimeout(resolve,ms))}
+async function serviceIsBack(){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),1400);try{const r=await fetch('/api/status?reconnect='+Date.now(),{cache:'no-store',signal:controller.signal});return r.ok}catch(e){return false}finally{clearTimeout(timer)}}
+async function beginRestart(title='Redémarrage en cours'){if(restarting)return;restarting=true;const overlay=$('restartOverlay');if(overlay)overlay.classList.add('show');if($('restartTitle'))$('restartTitle').textContent=title;if($('restartText'))$('restartText').textContent='Arrêt puis reconnexion automatique au mode SERVICE…';if($('liveLabel'))$('liveLabel').textContent='Redémarrage…';await delayMs(3500);for(let attempt=0;attempt<60;attempt++){if(await serviceIsBack()){if($('restartText'))$('restartText').textContent='SkimmerSense est de nouveau disponible. Actualisation…';await delayMs(500);location.reload();return}if($('restartText'))$('restartText').textContent='Reconnexion au mode SERVICE… '+(attempt+1)+'/60';await delayMs(1000)}if($('restartTitle'))$('restartTitle').textContent='Mode SERVICE non détecté';if($('restartText'))$('restartText').textContent='Si le jumper a été retiré, le fonctionnement Zigbee de production a démarré : l’absence de page Wi-Fi est normale. Sinon, réessaie.';if($('restartReload'))$('restartReload').classList.remove('hidden')}
 </script>)HTML");
   return html;
 }
@@ -738,6 +744,7 @@ void skmDiagSetSleep(uint8_t nextState, uint32_t sleepSeconds) {
   WebServer server(80);
   bool otaFinishedOk = false;
   String otaFailure;
+  uint32_t restartAtMs = 0;
 
   auto makeHeader = [&]() {
     return pageHeader(firmwareVersion, firmwareFlavor,
@@ -847,15 +854,15 @@ refreshLogs();setInterval(refreshLogs,2000);
 <section><div class="section-title"><div><h2>Capture de scénario</h2><small>Jusqu’à 50 réveils de production</small></div></div><div id="capture" class="card full"><div class="skeleton"></div></div></section>
 <section><div class="section-title"><div><h2>Journaux</h2><small>Cycles Zigbee, décisions et mesures</small></div></div><div class="card full"><div class="actions"><a class="button" href="/logs">Ouvrir les logs en direct</a><a class="button secondary" href="/logs-download">Télécharger</a></div></div></section>
 <section><div class="section-title"><div><h2>Mise à jour OTA</h2><small>Écriture sécurisée dans le slot applicatif inactif</small></div></div><div class="card full">
-<div class="warn"><strong>Après une mise à jour réussie :</strong> retire le jumper SERVICE D6–GND avant de redémarrer pour revenir en production.</div>
+<div class="warn"><strong>Redémarrage automatique après installation.</strong> Pour revenir directement en production, retire le jumper SERVICE D6–GND avant de cliquer sur « Installer ». La page restera accessible pendant l’envoi.</div>
 <form id="otaForm" class="filebox"><input id="firmwareFile" type="file" name="firmware" accept=".bin" required><div class="actions" style="margin-top:13px"><button id="otaButton" type="submit">Installer le firmware</button></div><progress id="otaProgress" class="hidden" value="0" max="100"></progress><div id="otaText" class="sub" style="margin-top:8px"></div></form>
 </div></section>
 <section><div class="section-title"><div><h2>Redémarrage</h2><small>Le mode sélectionné dépend de la position du jumper</small></div></div><div class="card full"><button class="danger" onclick="rebootDevice()">Redémarrer SkimmerSense</button></div></section>
 <script>
 let statusBusy=false;
-window.refreshDashboard=async function(){if(statusBusy)return;statusBusy=true;try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const maxDetails=$('max17048Details'),maxOpen=maxDetails&&maxDetails.open;$('hardware').innerHTML=d.hardware;if(maxOpen&&$('max17048Details'))$('max17048Details').open=true;$('diagnostics').innerHTML=d.diagnostics;$('resets').innerHTML=d.resets;$('rssi').textContent=d.wifi_connected?d.wifi_rssi+' dBm':'hors ligne';$('heap').textContent=Math.round(d.heap/1024)+' Ko';$('uptime').textContent=formatUptime(d.uptime);$('liveLabel').textContent='Mis à jour à '+new Date().toLocaleTimeString();$('capture').innerHTML=d.capture_active?'<div class="ok"><strong>Capture active</strong> · '+d.capture_remaining+' réveil(s) restant(s)</div><button class="secondary" onclick="postAction(\'/capture-cancel\',\'Capture annulée\')">Annuler la capture</button>':'<p class="sub">Enregistre les prochains réveils de production afin de reconstituer un scénario complet, même après plusieurs passages en veille.</p><button onclick="postAction(\'/capture-next\',\'Capture activée\')">Capturer les 50 prochains réveils</button>';}catch(e){$('liveLabel').textContent='Connexion interrompue';toast('Tableau de bord momentanément inaccessible',true)}finally{statusBusy=false}}
-function uploadFirmware(event){event.preventDefault();const file=$('firmwareFile').files[0];if(!file){toast('Sélectionne un fichier firmware.bin',true);return}if(!file.name.toLowerCase().endsWith('.bin')){toast('Le fichier doit être au format .bin',true);return}const form=new FormData();form.append('firmware',file);const xhr=new XMLHttpRequest(),bar=$('otaProgress'),button=$('otaButton'),label=$('otaText');button.disabled=true;bar.classList.remove('hidden');bar.value=0;label.textContent='Préparation de l’envoi…';xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded*100/e.total);bar.value=p;label.textContent='Téléversement : '+p+' %'}};xhr.onload=()=>{button.disabled=false;let d={};try{d=JSON.parse(xhr.responseText)}catch(e){}if(xhr.status>=200&&xhr.status<300&&d.ok!==false){bar.value=100;label.innerHTML='<span class="ok" style="display:block">Firmware installé. Retire maintenant le jumper SERVICE, puis redémarre.</span><button type="button" class="danger" onclick="rebootDevice()">Redémarrer</button>';toast(d.message||'Mise à jour OTA réussie')}else{label.textContent=d.message||'Échec de la mise à jour OTA';toast(label.textContent,true)}};xhr.onerror=()=>{button.disabled=false;label.textContent='Connexion interrompue pendant l’OTA';toast(label.textContent,true)};xhr.open('POST','/update?ajax=1');xhr.send(form)}
-async function rebootDevice(){toast('Redémarrage en cours…');try{await fetch('/reboot?ajax=1',{method:'POST'})}catch(e){}setTimeout(()=>{$('liveLabel').textContent='Redémarrage…'},300)}
+window.refreshDashboard=async function(){if(statusBusy||restarting)return;statusBusy=true;try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const maxDetails=$('max17048Details'),maxOpen=maxDetails&&maxDetails.open;$('hardware').innerHTML=d.hardware;if(maxOpen&&$('max17048Details'))$('max17048Details').open=true;$('diagnostics').innerHTML=d.diagnostics;$('resets').innerHTML=d.resets;$('rssi').textContent=d.wifi_connected?d.wifi_rssi+' dBm':'hors ligne';$('heap').textContent=Math.round(d.heap/1024)+' Ko';$('uptime').textContent=formatUptime(d.uptime);$('liveLabel').textContent='Mis à jour à '+new Date().toLocaleTimeString();$('capture').innerHTML=d.capture_active?'<div class="ok"><strong>Capture active</strong> · '+d.capture_remaining+' réveil(s) restant(s)</div><button class="secondary" onclick="postAction(\'/capture-cancel\',\'Capture annulée\')">Annuler la capture</button>':'<p class="sub">Enregistre les prochains réveils de production afin de reconstituer un scénario complet, même après plusieurs passages en veille.</p><button onclick="postAction(\'/capture-next\',\'Capture activée\')">Capturer les 50 prochains réveils</button>';}catch(e){$('liveLabel').textContent='Connexion interrompue';toast('Tableau de bord momentanément inaccessible',true)}finally{statusBusy=false}}
+function uploadFirmware(event){event.preventDefault();const file=$('firmwareFile').files[0];if(!file){toast('Sélectionne un fichier firmware.bin',true);return}if(!file.name.toLowerCase().endsWith('.bin')){toast('Le fichier doit être au format .bin',true);return}const form=new FormData();form.append('firmware',file);const xhr=new XMLHttpRequest(),bar=$('otaProgress'),button=$('otaButton'),label=$('otaText');button.disabled=true;bar.classList.remove('hidden');bar.value=0;label.textContent='Préparation de l’envoi…';xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded*100/e.total);bar.value=p;label.textContent='Téléversement : '+p+' %'}};xhr.onload=()=>{let d={};try{d=JSON.parse(xhr.responseText)}catch(e){}if(xhr.status>=200&&xhr.status<300&&d.ok!==false){bar.value=100;label.innerHTML='<span class="ok" style="display:block">Firmware installé. Redémarrage automatique…</span>';toast(d.message||'Mise à jour OTA réussie');beginRestart('Firmware installé')}else{button.disabled=false;label.textContent=d.message||'Échec de la mise à jour OTA';toast(label.textContent,true)}};xhr.onerror=()=>{if(!restarting){button.disabled=false;label.textContent='Connexion interrompue pendant l’OTA';toast(label.textContent,true)}};xhr.open('POST','/update?ajax=1');xhr.send(form)}
+async function rebootDevice(){if(restarting)return;try{const r=await fetch('/reboot?ajax=1',{method:'POST',cache:'no-store'});if(!r.ok)throw new Error('Redémarrage refusé');beginRestart('Redémarrage demandé')}catch(e){toast(e.message||String(e),true)}}
 $('otaForm').addEventListener('submit',uploadFirmware);refreshDashboard();setInterval(refreshDashboard,5000);
 </script>)HTML");
     html += pageFooter();
@@ -872,8 +879,7 @@ $('otaForm').addEventListener('submit',uploadFirmware);refreshDashboard();setInt
       server.send(200, "text/html; charset=utf-8",
                   "<html><body><h2>Redémarrage…</h2></body></html>");
     }
-    delay(400);
-    ESP.restart();
+    restartAtMs = millis() + 1200UL;
   });
 
   server.on(
@@ -882,9 +888,10 @@ $('otaForm').addEventListener('submit',uploadFirmware);refreshDashboard();setInt
         if (server.hasArg("ajax")) {
           String json;
           if (otaFinishedOk && !Update.hasError()) {
-            json = F("{\"ok\":true,\"message\":\"Mise à jour OTA terminée\"}");
+            json = F("{\"ok\":true,\"message\":\"Mise à jour OTA terminée, redémarrage automatique\"}");
             server.sendHeader("Connection", "close");
             server.send(200, "application/json; charset=utf-8", json);
+            restartAtMs = millis() + 1800UL;
           } else {
             json = F("{\"ok\":false,\"message\":\"");
             json += jsonEscape(otaFailure.length()
@@ -897,7 +904,8 @@ $('otaForm').addEventListener('submit',uploadFirmware);refreshDashboard();setInt
         } else {
           String html = makeHeader();
           if (otaFinishedOk && !Update.hasError()) {
-            html += F("<section><div class='card full'><h2>Mise à jour OTA réussie</h2><div class='warn'><strong>Retire le jumper SERVICE D6–GND</strong>, puis redémarre pour revenir en production.</div><form method='POST' action='/reboot'><button type='submit'>Redémarrer</button></form></div></section>");
+            html += F("<section><div class='card full'><h2>Mise à jour OTA réussie</h2><div class='ok'>Redémarrage automatique en cours…</div></div></section><script>beginRestart('Firmware installé')</script>");
+            restartAtMs = millis() + 1800UL;
           } else {
             html += F("<section><div class='card full'><h2>Échec de la mise à jour OTA</h2><p>");
             html += otaFailure.length() ? otaFailure : String(F("La bibliothèque OTA a signalé une erreur."));
@@ -955,6 +963,13 @@ $('otaForm').addEventListener('submit',uploadFirmware);refreshDashboard();setInt
 
   while (true) {
     server.handleClient();
+    if (restartAtMs != 0 &&
+        static_cast<int32_t>(millis() - restartAtMs) >= 0) {
+      Serial.println("Scheduled web restart now.");
+      Serial.flush();
+      delay(30);
+      ESP.restart();
+    }
     delay(2);
   }
 }
