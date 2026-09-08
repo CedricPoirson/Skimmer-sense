@@ -21,7 +21,7 @@ The result is a local, cloud-free refill system with physical hysteresis, wave r
 | Zigbee sleepy End Device | Integrates locally with Zigbee2MQTT while preserving battery life |
 | Temperature-adaptive deep sleep | Reports more often when useful and sleeps longer in mild conditions |
 | Persistent critical completion | Retains the final LOW/HIGH snapshot in RTC and retries three-copy delivery after Zigbee failures |
-| MAX17048 fuel gauge | Reports battery percentage and voltage to Home Assistant and wakes immediately on a low-battery alert |
+| MAX17048 fuel gauge | Reports battery percentage to Home Assistant, monitors voltage locally and wakes immediately on a low-battery alert |
 | SERVICE jumper | Enables Wi-Fi diagnostics, retained logs and browser-based OTA updates |
 | Layered safety | Home Assistant timeout, independent IPX800 timeout and normally-closed valve |
 
@@ -46,11 +46,11 @@ The result is a local, cloud-free refill system with physical hysteresis, wave r
 - **Automation:** Home Assistant controlling an IPX800 V4 dry-contact relay
 - **Power:** protected 1S 18650 battery with deep sleep
 - **Maintenance:** D6/GPIO16 jumper, Wi-Fi portal, downloadable diagnostics and OTA
-- **Current firmware:** v0.9.14 production candidate
+- **Current firmware:** v0.9.15 production candidate
 
 ## Current status
 
-Firmware **v0.9.14** is a production candidate. The established sensing, Zigbee and deep-sleep paths are hardware-validated; the reinforced battery telemetry and fast-poll cold-boot interview window still require validation on the current prototype. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
+Firmware **v0.9.15** is a production candidate. The established sensing, Zigbee and deep-sleep paths are hardware-validated; battery percentage reporting and the fast-poll cold-boot interview window are validated on the current prototype. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
 
 Validated on the current XIAO ESP32-C6 prototype:
 
@@ -258,7 +258,7 @@ The production candidate therefore:
 1. wakes and reads the real sensors first
 2. preloads the temperature and float values **before** `Zigbee.begin()`
 3. reconnects Zigbee
-4. sends explicit, zero-initialized reports for temperature, float states, battery percentage and battery voltage
+4. sends explicit, zero-initialized reports for temperature, float states and battery percentage
 5. avoids runtime Zigbee attribute mutation
 6. returns to deep sleep
 
@@ -272,7 +272,8 @@ The current Arduino-ESP32 version is handled with the same safe preload pattern 
 - raw SOC remains visible in SERVICE and serial diagnostics
 - SOC is clamped and rounded locally to 0-100%
 - the Power Configuration cluster is created and preloaded before `Zigbee.begin()`
-- the preloaded standard battery percentage and voltage attributes are each reported twice during an already-active Zigbee window
+- the preloaded standard battery percentage attribute is reported twice during an already-active Zigbee window
+- battery voltage remains available in local SERVICE diagnostics; explicit Zigbee reporting is disabled because the current Arduino-Zigbee stack returns `ESP_ERR_NOT_SUPPORTED`
 - no battery attribute is mutated while ZBOSS is running
 - a MAX17048 hardware alert wakes the device and requests an immediate battery report
 

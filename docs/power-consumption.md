@@ -126,11 +126,11 @@ The validated low-power workaround is therefore:
 4. reconnect with a bounded wait
 5. send explicit zero-initialized reports for temperature and/or float states
 6. preload Zigbee Power Configuration before `Zigbee.begin()`
-7. explicitly report the already-preloaded battery percentage and voltage twice without runtime mutation
+7. explicitly report the already-preloaded battery percentage twice without runtime mutation
 8. wait briefly for delivery
 9. return to deep sleep
 
-Earlier framework builds asserted when the battery cluster or its attributes were changed while ZBOSS was active. The production firmware now creates and preloads Power Configuration before `Zigbee.begin()`, then reports the immutable preloaded percentage and voltage twice in the same awake window. This adds no wake cycle and only a few short frames. MAX17048 alerts are configured for 15% SOC and 3.40 V and request an immediate Zigbee battery report.
+Earlier framework builds asserted when the battery cluster or its attributes were changed while ZBOSS was active. The production firmware now creates and preloads Power Configuration before `Zigbee.begin()`, then reports the immutable preloaded percentage twice in the same awake window. Explicit Battery Voltage reporting is intentionally skipped because Arduino-Zigbee 3.3.x returns `ESP_ERR_NOT_SUPPORTED`; voltage remains monitored locally and visible in SERVICE mode. This adds no wake cycle and only two short frames. MAX17048 alerts are configured for 15% SOC and 3.40 V and request an immediate Zigbee battery report.
 
 After a cold/software boot (including an OTA restart), the Zigbee stack remains awake for an additional 30 seconds and polls its parent every 500 ms so Zigbee2MQTT can complete endpoint and cluster discovery. Normal timer or GPIO deep-sleep wakes keep the 10-second polling configuration and do not pay this one-time commissioning cost.
 
