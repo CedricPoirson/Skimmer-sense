@@ -113,11 +113,18 @@ static_assert(SKIMMERSENSE_BATTERY_REPORT_COPIES >= 1U &&
               SKIMMERSENSE_BATTERY_REPORT_COPIES <= 3U,
               "Battery report copies must be between 1 and 3");
 
+// A fresh/OTA boot causes a device announce. Keep the Zigbee stack available
+// long enough for Zigbee2MQTT to read the endpoint and cluster descriptors.
+// Deep-sleep timer/GPIO wakes do not pay this commissioning cost.
+#ifndef SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS
+#define SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS 30000UL
+#endif
+
 #include "Zigbee.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.12-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.13-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -1405,6 +1412,27 @@ void setup() {
       plan.reportTemperature = false;
       plan.reportFloats = false;
     } else {
+      if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+        Serial.printf(
+            "Cold-boot Zigbee interview window: %lu ms...\n",
+            static_cast<unsigned long>(
+                SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS));
+        skmCycleLogAppend(
+            "Cold-boot Zigbee interview window: %lu ms",
+            static_cast<unsigned long>(
+                SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS));
+
+        const uint32_t interviewStartedAt = millis();
+        while (millis() - interviewStartedAt <
+               SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS) {
+          // The Zigbee stack runs in its own task. Yield here and keep the
+          // active-cycle watchdog fed while interview requests are answered.
+          esp_task_wdt_reset();
+          delay(100);
+        }
+        Serial.println("Cold-boot Zigbee interview window complete.");
+      }
+
       Serial.printf("Connected; idling %lu ms without runtime attribute writes...\n",
                     static_cast<unsigned long>(SKIMMERSENSE_ZIGBEE_IDLE_MS));
       delay(SKIMMERSENSE_ZIGBEE_IDLE_MS);
