@@ -82,7 +82,7 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.8-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.9-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -607,10 +607,21 @@ bool configureZigbeeEndpoints(const SensorSnapshot &snapshot) {
   zbTemperature.setMinMaxValue(-10, 60);
   zbTemperature.setDefaultValue(snapshot.waterTemperatureC);
   zbTemperature.setTolerance(1);
-// Power Configuration disabled.
-// ESP32-C6 Arduino Zigbee stack / ZBOSS crash observed with setPowerSource().
-// Battery monitoring remains available through MAX17048.
-  ok &= true;
+
+  // Create and preload the standard Power Configuration server cluster before
+  // Zigbee.begin(). Runtime attribute setters previously triggered a ZBOSS
+  // assertion on ESP32-C6, so battery values are never mutated after start.
+  // Battery percentage uses Zigbee half-percent units internally; the Arduino
+  // wrapper performs that conversion here. Voltage uses 100 mV units.
+  if (snapshot.batteryValid) {
+    ok &= zbTemperature.setPowerSource(
+        ZB_POWER_SOURCE_BATTERY,
+        snapshot.batteryPercent,
+        snapshot.batteryVoltageZcl);
+  } else {
+    Serial.println(
+        "Battery cluster omitted: MAX17048 snapshot unavailable.");
+  }
 
   zbLowLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   ok &= zbLowLevel.addBinaryInput();
@@ -1130,7 +1141,7 @@ void setup() {
   Serial.printf(" %s\n", FIRMWARE_FLAVOR);
   Serial.println(" Battery monitoring: MAX17048 enabled");
   Serial.printf(" RF antenna: %s\n", skmRadioAntennaName());
-  Serial.println(" Zigbee Power Configuration disabled (ZBOSS workaround)");
+  Serial.println(" Zigbee battery percentage: Power Configuration cluster");
   Serial.println("========================================");
   printWakeReason();
   Serial.printf("RTC state: %s\n", stateName(state));
@@ -1359,7 +1370,15 @@ void setup() {
       }
 
       if (snapshot.batteryValid) {
-        Serial.println("Report battery     : SKIPPED - ZBOSS bug");
+        // Report the preloaded standard battery percentage attribute directly.
+        // Do not call setBatteryPercentage() after Zigbee.begin(): runtime
+        // attribute writes were the source of the previous ZBOSS crash.
+        reportsOk &= sendSafeReport(
+            ZB_EP_TEMPERATURE,
+            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+            ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+            "battery");
+        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
       }
 
       Serial.printf("Post-report confirmation wait: %lu ms...\n",
