@@ -21,7 +21,7 @@ The result is a local, cloud-free refill system with physical hysteresis, wave r
 | Zigbee sleepy End Device | Integrates locally with Zigbee2MQTT while preserving battery life |
 | Temperature-adaptive deep sleep | Reports more often when useful and sleeps longer in mild conditions |
 | Persistent critical completion | Retains the final LOW/HIGH snapshot in RTC and retries three-copy delivery after Zigbee failures |
-| MAX17048 fuel gauge | Measures battery voltage and state of charge locally |
+| MAX17048 fuel gauge | Reports battery percentage to Home Assistant and wakes immediately on a low-battery alert |
 | SERVICE jumper | Enables Wi-Fi diagnostics, retained logs and browser-based OTA updates |
 | Layered safety | Home Assistant timeout, independent IPX800 timeout and normally-closed valve |
 
@@ -46,11 +46,11 @@ The result is a local, cloud-free refill system with physical hysteresis, wave r
 - **Automation:** Home Assistant controlling an IPX800 V4 dry-contact relay
 - **Power:** protected 1S 18650 battery with deep sleep
 - **Maintenance:** D6/GPIO16 jumper, Wi-Fi portal, downloadable diagnostics and OTA
-- **Current firmware:** v0.9.2 production candidate
+- **Current firmware:** v0.9.11 production candidate
 
 ## Current status
 
-Firmware **v0.9.2** is a hardware-validated production candidate. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
+Firmware **v0.9.11** is a hardware-validated production candidate. Active development, SERVICE-mode diagnostics and Wi-Fi OTA are available on [`feature/service-mode-ota`](https://github.com/CedricPoirson/Skimmer-sense/tree/feature/service-mode-ota).
 
 Validated on the current XIAO ESP32-C6 prototype:
 
@@ -185,7 +185,7 @@ Manufacturer/model strings:
 - Manufacturer: `SkimmerSense`
 - Model: `SkimmerSense-v1`
 
-MAX17048 voltage/SOC remain available in serial diagnostics, but Zigbee Power Configuration setup/reporting is disabled on this stack because it triggers a reproducible ZBOSS failure.
+MAX17048 SOC is preloaded before `Zigbee.begin()` and reported through the standard Zigbee Power Configuration cluster. Runtime attribute mutation remains prohibited because it triggered the earlier ZBOSS failure.
 
 The float endpoints intentionally expose the physical contact state. Semantic states such as low water, normal level, refill and float fault are derived in Home Assistant.
 
@@ -258,23 +258,25 @@ The production candidate therefore:
 1. wakes and reads the real sensors first
 2. preloads the temperature and float values **before** `Zigbee.begin()`
 3. reconnects Zigbee
-4. sends explicit, zero-initialized reports for temperature and the float states only
+4. sends explicit, zero-initialized reports for temperature, float states and battery percentage
 5. avoids runtime Zigbee attribute mutation
 6. returns to deep sleep
 
-### Battery reporting limitation
+### Battery reporting workaround
 
 During isolation tests, explicit `Power Configuration / Battery Percentage Remaining` reports reproducibly asserted in `esp_zigbee_zcl_command.c:263`, including when addressed directly to coordinator `0x0000` endpoint 1. `ZigbeeTempSensor::setPowerSource(...)` also caused a ZBOSS crash in this firmware configuration.
 
-Current safe behavior:
+The current Arduino-ESP32 version is handled with the same safe preload pattern used for the other attributes:
 
 - MAX17048 voltage and raw SOC are read normally
-- raw SOC remains visible in serial diagnostics
-- SOC is clamped locally to 0-100% for diagnostics/future use
-- Zigbee Power Configuration setup via `setPowerSource()` is disabled
-- explicit battery reporting is disabled
+- raw SOC remains visible in SERVICE and serial diagnostics
+- SOC is clamped and rounded locally to 0-100%
+- the Power Configuration cluster is created and preloaded before `Zigbee.begin()`
+- only the preloaded `Battery Percentage Remaining` attribute is explicitly reported
+- no battery attribute is mutated while ZBOSS is running
+- a MAX17048 hardware alert wakes the device and requests an immediate battery report
 
-This is an intentional workaround, not a missing call. Battery monitoring remains local through the MAX17048 until a framework version is verified to fix the ZBOSS issue.
+This preserves native Zigbee2MQTT/Home Assistant battery discovery without returning to the unsafe runtime-setter path.
 
 ### Sleepy End Device aging timeout
 

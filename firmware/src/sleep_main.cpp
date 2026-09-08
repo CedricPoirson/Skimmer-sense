@@ -3,6 +3,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include "esp_sleep.h"
+#include "esp_task_wdt.h"
 #include "driver/rtc_io.h"
 #include "soc/soc_caps.h"
 #include "skm_radio.h"
@@ -47,6 +48,24 @@
 #define SKIMMERSENSE_ZIGBEE_RETRY_SECONDS 300ULL
 #endif
 
+#ifndef SKIMMERSENSE_ACTIVE_WATCHDOG_MS
+#define SKIMMERSENSE_ACTIVE_WATCHDOG_MS 120000UL
+#endif
+
+#ifndef SKIMMERSENSE_MAX17048_ALERT_PERCENT
+#define SKIMMERSENSE_MAX17048_ALERT_PERCENT 15U
+#endif
+
+#ifndef SKIMMERSENSE_MAX17048_LOW_VOLTAGE_MV
+#define SKIMMERSENSE_MAX17048_LOW_VOLTAGE_MV 3400U
+#endif
+
+static_assert(SKIMMERSENSE_MAX17048_ALERT_PERCENT >= 1U &&
+              SKIMMERSENSE_MAX17048_ALERT_PERCENT <= 32U,
+              "MAX17048 SOC alert must be between 1 and 32 percent");
+static_assert(SKIMMERSENSE_MAX17048_LOW_VOLTAGE_MV <= 5100U,
+              "MAX17048 voltage alert must be at most 5.1 V");
+
 static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
               SKIMMERSENSE_ZIGBEE_CHANNEL <= 26,
               "Zigbee channel must be between 11 and 26");
@@ -82,7 +101,7 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.10-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.11-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -488,6 +507,43 @@ bool writeRegister16(uint8_t reg, uint16_t value) {
   return Wire.endTransmission() == 0;
 }
 
+bool configureMax17048Alerts() {
+  uint16_t config = 0;
+  uint16_t voltageAlert = 0;
+  if (!readRegister16(MAX17048_REG_CONFIG, config) ||
+      !readRegister16(MAX17048_REG_VALRT, voltageAlert)) {
+    Serial.println("MAX17048 alert configuration: register read failed");
+    return false;
+  }
+
+  // CONFIG.ATHD is encoded as 32 - percentage in the low five bits.
+  const uint16_t socThreshold =
+      static_cast<uint16_t>(32U - SKIMMERSENSE_MAX17048_ALERT_PERCENT);
+  const uint16_t wantedConfig =
+      static_cast<uint16_t>((config & 0xFFE0U) | socThreshold);
+
+  // VALRT.MIN is the high byte in 20 mV units. Preserve VALRT.MAX.
+  const uint16_t lowVoltageUnits = static_cast<uint16_t>(
+      (SKIMMERSENSE_MAX17048_LOW_VOLTAGE_MV + 10U) / 20U);
+  const uint16_t wantedVoltageAlert = static_cast<uint16_t>(
+      (lowVoltageUnits << 8) | (voltageAlert & 0x00FFU));
+
+  bool ok = true;
+  if (wantedConfig != config) {
+    ok &= writeRegister16(MAX17048_REG_CONFIG, wantedConfig);
+  }
+  if (wantedVoltageAlert != voltageAlert) {
+    ok &= writeRegister16(MAX17048_REG_VALRT, wantedVoltageAlert);
+  }
+
+  Serial.printf(
+      "MAX17048 alerts: SOC %u %% / low voltage %.2f V / configuration %s\n",
+      static_cast<unsigned>(SKIMMERSENSE_MAX17048_ALERT_PERCENT),
+      static_cast<double>(SKIMMERSENSE_MAX17048_LOW_VOLTAGE_MV) / 1000.0,
+      ok ? "OK" : "FAILED");
+  return ok;
+}
+
 void acknowledgeMax17048Alert() {
   uint16_t rawStatus = 0;
   uint16_t config = 0;
@@ -497,9 +553,15 @@ void acknowledgeMax17048Alert() {
   }
 
   const uint8_t status = static_cast<uint8_t>(rawStatus >> 8);
-  if (status & MAX17048_STATUS_RI) {
+  const uint8_t alertFlags = static_cast<uint8_t>(
+      MAX17048_STATUS_SC | MAX17048_STATUS_HD | MAX17048_STATUS_VR |
+      MAX17048_STATUS_VL | MAX17048_STATUS_VH | MAX17048_STATUS_RI);
+  if (status & alertFlags) {
+    // Preserve STATUS.EnVR and reserved bits; clear every captured alert
+    // descriptor after it has been copied into SensorSnapshot.
     writeRegister16(MAX17048_REG_STATUS,
-                    rawStatus & ~(static_cast<uint16_t>(MAX17048_STATUS_RI) << 8));
+                    rawStatus &
+                        ~(static_cast<uint16_t>(alertFlags) << 8));
   }
   if (config & MAX17048_CONFIG_ALRT) {
     writeRegister16(MAX17048_REG_CONFIG, config & ~MAX17048_CONFIG_ALRT);
@@ -527,7 +589,7 @@ float readWaterTemperatureC() {
   return value;
 }
 
-SensorSnapshot readBaseSensorSnapshot() {
+SensorSnapshot readBaseSensorSnapshot(bool manageAlerts = true) {
   SensorSnapshot snapshot;
 
   releaseRtcWakePins();
@@ -583,7 +645,10 @@ SensorSnapshot readBaseSensorSnapshot() {
     }
   }
 
-  acknowledgeMax17048Alert();
+  if (snapshot.batteryValid && manageAlerts) {
+    configureMax17048Alerts();
+    acknowledgeMax17048Alert();
+  }
   return snapshot;
 }
 
@@ -928,10 +993,10 @@ CyclePlan makePlan(LevelState state,
         plan.reportTemperature = plan.useZigbee;
         plan.reportFloats = plan.useZigbee;
         if (maxWake) {
-          plan.useZigbee = false;  // Battery report path is unsafe in this ZBOSS version.
+          plan.useZigbee = true;
           plan.reportTemperature = false;
           plan.reportFloats = false;
-          plan.reason = "MAX17048 alert acknowledged; battery report intentionally skipped";
+          plan.reason = "MAX17048 alert -> immediate battery report";
         }
       }
       break;
@@ -992,10 +1057,11 @@ CyclePlan makePlan(LevelState state,
           plan.reportFloats = false;
         }
         if (maxWake) {
-          plan.useZigbee = false;
+          plan.useZigbee = true;
           plan.reportTemperature = false;
           plan.reportFloats = false;
-          plan.reason = "MAX17048 alert acknowledged while WAIT_HIGH; continue watching HIGH";
+          plan.reason =
+              "MAX17048 alert while WAIT_HIGH -> battery report; continue watching HIGH";
         }
       }
       break;
@@ -1127,6 +1193,29 @@ void setup() {
   Serial.begin(115200);
   skmSelectRadioAntenna();
   delay(SKIMMERSENSE_SERIAL_STARTUP_MS);
+
+  const esp_task_wdt_config_t watchdogConfig = {
+      .timeout_ms = SKIMMERSENSE_ACTIVE_WATCHDOG_MS,
+      .idle_core_mask = 0,
+      .trigger_panic = true,
+  };
+  esp_err_t watchdogResult = esp_task_wdt_init(&watchdogConfig);
+  if (watchdogResult == ESP_ERR_INVALID_STATE) {
+    watchdogResult = esp_task_wdt_reconfigure(&watchdogConfig);
+  }
+  if (watchdogResult == ESP_OK) {
+    const esp_err_t subscribeResult = esp_task_wdt_add(nullptr);
+    if (subscribeResult != ESP_OK) {
+      Serial.printf("Active-cycle watchdog subscription: %s\n",
+                    esp_err_to_name(subscribeResult));
+    } else {
+      Serial.printf("Active-cycle watchdog: %lu ms\n",
+                    static_cast<unsigned long>(SKIMMERSENSE_ACTIVE_WATCHDOG_MS));
+    }
+  } else {
+    Serial.printf("Active-cycle watchdog setup failed: %s\n",
+                  esp_err_to_name(watchdogResult));
+  }
   skmCycleLogBegin();
   skmCycleLogAppend("Firmware: %s / %s", FIRMWARE_VERSION, FIRMWARE_FLAVOR);
   skmCycleLogAppend("RF antenna: %s", skmRadioAntennaName());

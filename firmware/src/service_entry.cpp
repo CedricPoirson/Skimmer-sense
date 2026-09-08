@@ -195,7 +195,9 @@ const char *batteryServiceDisplayName(const SensorSnapshot &snapshot,
 }
 
 String buildServiceHardwareHtml() {
-  SensorSnapshot snapshot = readBaseSensorSnapshot();
+  // SERVICE diagnostics stay read-only. Production configures the alert
+  // thresholds before sleep; the live dashboard only observes registers.
+  SensorSnapshot snapshot = readBaseSensorSnapshot(false);
   readTemperatureIntoSnapshot(snapshot);
 
   String html;
