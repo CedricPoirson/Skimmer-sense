@@ -97,11 +97,27 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #define SKIMMERSENSE_CRITICAL_FINAL_REPORT_GAP_MS 1000UL
 #endif
 
+// Battery telemetry changes slowly. Repeating the two standard Power
+// Configuration attributes in an already-active Zigbee window costs very
+// little compared with starting the radio, while making a freshly restored
+// parent route much less likely to leave stale data in Zigbee2MQTT.
+#ifndef SKIMMERSENSE_BATTERY_REPORT_COPIES
+#define SKIMMERSENSE_BATTERY_REPORT_COPIES 2U
+#endif
+
+#ifndef SKIMMERSENSE_BATTERY_REPORT_GAP_MS
+#define SKIMMERSENSE_BATTERY_REPORT_GAP_MS 250UL
+#endif
+
+static_assert(SKIMMERSENSE_BATTERY_REPORT_COPIES >= 1U &&
+              SKIMMERSENSE_BATTERY_REPORT_COPIES <= 3U,
+              "Battery report copies must be between 1 and 3");
+
 #include "Zigbee.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.11-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.12-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
 static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
@@ -1459,15 +1475,35 @@ void setup() {
       }
 
       if (snapshot.batteryValid) {
-        // Report the preloaded standard battery percentage attribute directly.
-        // Do not call setBatteryPercentage() after Zigbee.begin(): runtime
-        // attribute writes were the source of the previous ZBOSS crash.
-        reportsOk &= sendSafeReport(
-            ZB_EP_TEMPERATURE,
-            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-            ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-            "battery");
-        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+        Serial.printf("Battery telemetry: sending %u percentage/voltage copies.\n",
+                      static_cast<unsigned>(SKIMMERSENSE_BATTERY_REPORT_COPIES));
+        skmCycleLogAppend(
+            "Battery telemetry: %u percentage/voltage copies requested",
+            static_cast<unsigned>(SKIMMERSENSE_BATTERY_REPORT_COPIES));
+
+        for (uint8_t copy = 0;
+             copy < static_cast<uint8_t>(SKIMMERSENSE_BATTERY_REPORT_COPIES);
+             ++copy) {
+          // Report only attributes preloaded before Zigbee.begin(). Runtime
+          // setters previously triggered a ZBOSS assertion on ESP32-C6.
+          reportsOk &= sendSafeReport(
+              ZB_EP_TEMPERATURE,
+              ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+              ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+              "battery-percent");
+          delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+          reportsOk &= sendSafeReport(
+              ZB_EP_TEMPERATURE,
+              ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+              ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
+              "battery-voltage");
+
+          if (copy + 1U < SKIMMERSENSE_BATTERY_REPORT_COPIES) {
+            delay(SKIMMERSENSE_BATTERY_REPORT_GAP_MS);
+          } else {
+            delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+          }
+        }
       }
 
       Serial.printf("Post-report confirmation wait: %lu ms...\n",

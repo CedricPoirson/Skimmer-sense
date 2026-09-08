@@ -126,11 +126,11 @@ The validated low-power workaround is therefore:
 4. reconnect with a bounded wait
 5. send explicit zero-initialized reports for temperature and/or float states
 6. preload Zigbee Power Configuration before `Zigbee.begin()`
-7. explicitly report the already-preloaded battery percentage without runtime mutation
+7. explicitly report the already-preloaded battery percentage and voltage twice without runtime mutation
 8. wait briefly for delivery
 9. return to deep sleep
 
-Earlier framework builds asserted when the battery cluster or its attributes were changed while ZBOSS was active. The production firmware now creates and preloads Power Configuration before `Zigbee.begin()`, then reports the immutable preloaded percentage. MAX17048 alerts are configured for 15% SOC and 3.40 V and request an immediate Zigbee battery report.
+Earlier framework builds asserted when the battery cluster or its attributes were changed while ZBOSS was active. The production firmware now creates and preloads Power Configuration before `Zigbee.begin()`, then reports the immutable preloaded percentage and voltage twice in the same awake window. This adds no wake cycle and only a few short frames. MAX17048 alerts are configured for 15% SOC and 3.40 V and request an immediate Zigbee battery report.
 
 Because Zigbee reconnect/report cycles are much more expensive than deep sleep, the adaptive schedule should reduce average consumption substantially versus the previous fixed 30-minute periodic refresh. Selective DS18B20 reads also remove the roughly 10-bit conversion/startup cost from short event-only wakes. Final autonomy must still be based on measured current rather than on wake-count reduction alone.
 
