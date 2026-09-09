@@ -54,7 +54,8 @@ static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
 
 // Validation timings. Production battery firmware will use deep sleep.
 static constexpr uint32_t TEMP_INTERVAL_MS = 60UL * 1000UL;
-static constexpr uint32_t FLOAT_DEBOUNCE_MS = 50;
+static constexpr uint32_t FLOAT_STABLE_MS = 250;
+static constexpr uint32_t FLOAT_HEARTBEAT_MS = 60UL * 1000UL;
 static constexpr uint32_t MAX17048_CHECK_INTERVAL_MS = 30UL * 1000UL;
 
 OneWire oneWire(PIN_DS18B20_DATA);
@@ -64,11 +65,20 @@ ZigbeeTempSensor zbTemperature(ZB_EP_TEMPERATURE);
 ZigbeeBinary zbLowLevel(ZB_EP_LOW_LEVEL);
 ZigbeeBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
 
-bool lastLowRaw = HIGH;
-bool lastHighRaw = HIGH;
+// Float handling deliberately keeps three notions separate:
+//   raw       = instantaneous GPIO reading
+//   candidate = most recent raw state that may become stable
+//   stable    = state accepted after FLOAT_STABLE_MS and published to Zigbee
+// This prevents wave/contact chatter from leaving Home Assistant on a stale state.
+bool lowCandidateRaw = HIGH;
+bool highCandidateRaw = HIGH;
+bool stableLowRaw = HIGH;
+bool stableHighRaw = HIGH;
+uint32_t lowCandidateSinceMs = 0;
+uint32_t highCandidateSinceMs = 0;
+uint32_t lastFloatHeartbeatMs = 0;
+
 bool lastMax17048Int = HIGH;
-uint32_t lastLowChangeMs = 0;
-uint32_t lastHighChangeMs = 0;
 uint32_t lastTemperatureMs = 0;
 uint32_t lastMax17048CheckMs = 0;
 
@@ -331,6 +341,47 @@ void publishTemperature(float temperatureC) {
   }
 }
 
+void updateLowFloat(uint32_t now) {
+  const bool raw = digitalRead(PIN_FLOAT_LOW);
+
+  if (raw != lowCandidateRaw) {
+    lowCandidateRaw = raw;
+    lowCandidateSinceMs = now;
+    Serial.printf("LOW float raw candidate: %s\n", contactState(raw));
+  }
+
+  if (lowCandidateRaw != stableLowRaw &&
+      now - lowCandidateSinceMs >= FLOAT_STABLE_MS) {
+    stableLowRaw = lowCandidateRaw;
+    Serial.printf("LOW-level float stable: %s\n", contactState(stableLowRaw));
+    publishLowFloat(stableLowRaw);
+  }
+}
+
+void updateHighFloat(uint32_t now) {
+  const bool raw = digitalRead(PIN_FLOAT_HIGH);
+
+  if (raw != highCandidateRaw) {
+    highCandidateRaw = raw;
+    highCandidateSinceMs = now;
+    Serial.printf("HIGH float raw candidate: %s\n", contactState(raw));
+  }
+
+  if (highCandidateRaw != stableHighRaw &&
+      now - highCandidateSinceMs >= FLOAT_STABLE_MS) {
+    stableHighRaw = highCandidateRaw;
+    Serial.printf("HIGH-level float stable: %s\n", contactState(stableHighRaw));
+    publishHighFloat(stableHighRaw);
+  }
+}
+
+void heartbeatFloats() {
+  Serial.printf("Float heartbeat | LOW=%s HIGH=%s\n",
+                contactState(stableLowRaw), contactState(stableHighRaw));
+  publishLowFloat(stableLowRaw, true);
+  publishHighFloat(stableHighRaw, true);
+}
+
 void configureZigbeeEndpoints() {
   zbTemperature.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   zbTemperature.setMinMaxValue(-10, 60);
@@ -373,8 +424,8 @@ void startZigbee() {
 
   zbTemperature.setReporting(1, 60, 1);
 
-  publishLowFloat(digitalRead(PIN_FLOAT_LOW), true);
-  publishHighFloat(digitalRead(PIN_FLOAT_HIGH), true);
+  publishLowFloat(stableLowRaw, true);
+  publishHighFloat(stableHighRaw, true);
   publishTemperature(readWaterTemperatureC());
 }
 
@@ -414,17 +465,22 @@ void setup() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(100000);
 
-  lastLowRaw = digitalRead(PIN_FLOAT_LOW);
-  lastHighRaw = digitalRead(PIN_FLOAT_HIGH);
+  const uint32_t now = millis();
+  stableLowRaw = digitalRead(PIN_FLOAT_LOW);
+  stableHighRaw = digitalRead(PIN_FLOAT_HIGH);
+  lowCandidateRaw = stableLowRaw;
+  highCandidateRaw = stableHighRaw;
+  lowCandidateSinceMs = now;
+  highCandidateSinceMs = now;
   lastMax17048Int = digitalRead(PIN_MAX17048_INT);
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" SkimmerSense v0.8 - MAX17048 CONFIG diag");
+  Serial.println(" SkimmerSense v0.9 - robust float reporting");
   Serial.println(" XIAO ESP32-C6 / Zigbee End Device");
   Serial.println("========================================");
-  Serial.printf("Float LOW : %s\n", contactState(lastLowRaw));
-  Serial.printf("Float HIGH: %s\n", contactState(lastHighRaw));
+  Serial.printf("Float LOW : %s\n", contactState(stableLowRaw));
+  Serial.printf("Float HIGH: %s\n", contactState(stableHighRaw));
   Serial.printf("MAX17048 INT: %s\n", max17048IntState(lastMax17048Int));
 
   // Startup attempt can be lost from the USB monitor; a second visible
@@ -437,10 +493,15 @@ void setup() {
 
   lastTemperatureMs = millis();
   lastMax17048CheckMs = millis();
+  lastFloatHeartbeatMs = millis();
 
   Serial.println();
   Serial.println("SkimmerSense is online.");
   Serial.println("Temperature interval: 60 seconds (test mode).");
+  Serial.printf("Float stable filter: %lu ms.\n",
+                static_cast<unsigned long>(FLOAT_STABLE_MS));
+  Serial.printf("Float Zigbee heartbeat: %lu seconds.\n",
+                static_cast<unsigned long>(FLOAT_HEARTBEAT_MS / 1000UL));
   Serial.println("MAX17048 telemetry interval: 30 seconds.");
   Serial.println("MAX17048 INT/STATUS/CONFIG diagnostic enabled.");
   Serial.println("Hold BOOT for >3 seconds to factory-reset Zigbee pairing.");
@@ -463,27 +524,19 @@ void loop() {
 
   handleFactoryResetButton();
 
-  const bool lowRaw = digitalRead(PIN_FLOAT_LOW);
-  if (lowRaw != lastLowRaw && now - lastLowChangeMs >= FLOAT_DEBOUNCE_MS) {
-    lastLowRaw = lowRaw;
-    lastLowChangeMs = now;
-    Serial.printf("LOW-level float changed: %s\n", contactState(lowRaw));
-    publishLowFloat(lowRaw);
-  }
-
-  const bool highRaw = digitalRead(PIN_FLOAT_HIGH);
-  if (highRaw != lastHighRaw && now - lastHighChangeMs >= FLOAT_DEBOUNCE_MS) {
-    lastHighRaw = highRaw;
-    lastHighChangeMs = now;
-    Serial.printf("HIGH-level float changed: %s\n", contactState(highRaw));
-    publishHighFloat(highRaw);
-  }
+  updateLowFloat(now);
+  updateHighFloat(now);
 
   const bool max17048Int = digitalRead(PIN_MAX17048_INT);
   if (max17048Int != lastMax17048Int) {
     lastMax17048Int = max17048Int;
     Serial.printf("MAX17048 INT changed: %s\n",
                   max17048IntState(max17048Int));
+  }
+
+  if (now - lastFloatHeartbeatMs >= FLOAT_HEARTBEAT_MS) {
+    lastFloatHeartbeatMs = now;
+    heartbeatFloats();
   }
 
   if (now - lastTemperatureMs >= TEMP_INTERVAL_MS) {
