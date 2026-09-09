@@ -86,9 +86,6 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #define SKIMMERSENSE_POST_REPORT_WAIT_MS 2000UL
 #endif
 
-// The end-of-refill transition is safety-critical. Because the validated
-// Arduino/ZBOSS stack does not emit delivery callbacks for attribute reports,
-// transmit the final LOW/HIGH state several times in the same awake window.
 #ifndef SKIMMERSENSE_CRITICAL_FINAL_REPORT_COPIES
 #define SKIMMERSENSE_CRITICAL_FINAL_REPORT_COPIES 3U
 #endif
@@ -97,12 +94,6 @@ static_assert(SKIMMERSENSE_ZIGBEE_CHANNEL >= 11 &&
 #define SKIMMERSENSE_CRITICAL_FINAL_REPORT_GAP_MS 1000UL
 #endif
 
-// Battery telemetry changes slowly. Repeating the standard percentage
-// attribute in an already-active Zigbee window costs very little compared
-// with starting the radio, while making a freshly restored parent route much
-// less likely to leave stale data in Zigbee2MQTT. Battery Voltage remains
-// preloaded for descriptor/read compatibility, but Arduino-Zigbee 3.3.x does
-// not support explicitly reporting it (ESP_ERR_NOT_SUPPORTED).
 #ifndef SKIMMERSENSE_BATTERY_REPORT_COPIES
 #define SKIMMERSENSE_BATTERY_REPORT_COPIES 2U
 #endif
@@ -115,9 +106,6 @@ static_assert(SKIMMERSENSE_BATTERY_REPORT_COPIES >= 1U &&
               SKIMMERSENSE_BATTERY_REPORT_COPIES <= 3U,
               "Battery report copies must be between 1 and 3");
 
-// A fresh/OTA boot causes a device announce. Keep the Zigbee stack available
-// long enough for Zigbee2MQTT to read the endpoint and cluster descriptors.
-// Deep-sleep timer/GPIO wakes do not pay this commissioning cost.
 #ifndef SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS
 #define SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS 30000UL
 #endif
@@ -134,31 +122,28 @@ static_assert(SKIMMERSENSE_BATTERY_REPORT_COPIES >= 1U &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.15-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.16-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
-static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
+static constexpr char FIRMWARE_VERSION[] = "0.9.16-antiwave";
 static constexpr char FIRMWARE_FLAVOR[] = "Anti-wave RTC state machine test";
 #endif
 
-static constexpr uint8_t PIN_FLOAT_LOW = D0;       // GPIO0, reed to GND
-static constexpr uint8_t PIN_FLOAT_HIGH = D1;      // GPIO1, reed to GND
+static constexpr uint8_t PIN_FLOAT_LOW = D0;
+static constexpr uint8_t PIN_FLOAT_HIGH = D1;
 static constexpr uint8_t PIN_DS18B20_POWER = D2;
 static constexpr uint8_t PIN_DS18B20_DATA = D3;
 static constexpr uint8_t PIN_I2C_SDA = D4;
 static constexpr uint8_t PIN_I2C_SCL = D5;
-static constexpr uint8_t PIN_MAX17048_INT = 4;     // GPIO4 / MTMS -> ALRT/INT
+static constexpr uint8_t PIN_MAX17048_INT = 4;
 
 static constexpr uint8_t MAX17048_I2C_ADDRESS = 0x36;
 static constexpr uint8_t MAX17048_REG_VCELL = 0x02;
 static constexpr uint8_t MAX17048_REG_SOC = 0x04;
-static constexpr uint8_t MAX17048_REG_MODE = 0x06;
 static constexpr uint8_t MAX17048_REG_VERSION = 0x08;
-static constexpr uint8_t MAX17048_REG_HIBRT = 0x0A;
 static constexpr uint8_t MAX17048_REG_CONFIG = 0x0C;
 static constexpr uint8_t MAX17048_REG_VALRT = 0x14;
 static constexpr uint8_t MAX17048_REG_CRATE = 0x16;
-static constexpr uint8_t MAX17048_REG_VRESET_ID = 0x18;
 static constexpr uint8_t MAX17048_REG_STATUS = 0x1A;
 static constexpr uint16_t MAX17048_CONFIG_ALRT = 0x0020;
 static constexpr uint8_t MAX17048_STATUS_RI = 0x01;
@@ -172,6 +157,7 @@ static constexpr float MAX17048_CRATE_LSB_PERCENT_PER_HOUR = 0.208f;
 static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
 static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
 static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
+static constexpr uint8_t ZB_EP_SENSOR_FAULT = 13;
 
 struct ZigbeeReportConfirmation {
   volatile bool expected = false;
@@ -180,26 +166,26 @@ struct ZigbeeReportConfirmation {
   volatile uint8_t tsn = 0;
 };
 
-ZigbeeReportConfirmation zbReportConfirmations[3];
+ZigbeeReportConfirmation zbReportConfirmations[4];
 
 int reportConfirmationIndex(uint8_t endpoint) {
   if (endpoint == ZB_EP_TEMPERATURE) return 0;
   if (endpoint == ZB_EP_LOW_LEVEL) return 1;
   if (endpoint == ZB_EP_HIGH_LEVEL) return 2;
+  if (endpoint == ZB_EP_SENSOR_FAULT) return 3;
   return -1;
 }
 
 const char *reportConfirmationLabel(size_t index) {
   static constexpr const char *LABELS[] = {
-      "temperature", "low-float", "high-float"};
-  return index < 3 ? LABELS[index] : "unknown";
+      "temperature", "low-float", "high-float", "sensor-fault"};
+  return index < 4 ? LABELS[index] : "unknown";
 }
 
 void zigbeeCommandSendStatusCallback(
     esp_zb_zcl_command_send_status_message_t message) {
   const int index = reportConfirmationIndex(message.src_endpoint);
   if (index < 0) return;
-
   zbReportConfirmations[index].status = message.status;
   zbReportConfirmations[index].tsn = message.tsn;
   zbReportConfirmations[index].received = true;
@@ -225,48 +211,29 @@ void expectZigbeeReportConfirmation(uint8_t endpoint) {
 
 bool logZigbeeReportConfirmationFailures() {
   bool explicitFailureDetected = false;
-
-  for (size_t index = 0; index < 3; ++index) {
-    const ZigbeeReportConfirmation &confirmation =
-        zbReportConfirmations[index];
+  for (size_t index = 0; index < 4; ++index) {
+    const ZigbeeReportConfirmation &confirmation = zbReportConfirmations[index];
     if (!confirmation.expected) continue;
-
-    // Arduino-ESP32/ZBOSS does not emit this callback for attribute-report
-    // commands on the validated stack version. Missing callback data is
-    // therefore diagnostic-only and must never shorten the production sleep.
     if (!confirmation.received) {
-      Serial.printf(
-          "Report %-12s: delivery confirmation unavailable "
-          "(stack callback not emitted)\n",
-          reportConfirmationLabel(index));
-      skmCycleLogAppend(
-          "Report %s: delivery confirmation unavailable "
-          "(stack callback not emitted)",
-          reportConfirmationLabel(index));
+      Serial.printf("Report %-12s: delivery confirmation unavailable (stack callback not emitted)\n",
+                    reportConfirmationLabel(index));
+      skmCycleLogAppend("Report %s: delivery confirmation unavailable (stack callback not emitted)",
+                        reportConfirmationLabel(index));
       continue;
     }
-
-    const esp_err_t status = confirmation.status;
-    const bool ok = status == ESP_OK;
+    const bool ok = confirmation.status == ESP_OK;
     explicitFailureDetected |= !ok;
     Serial.printf("Report %-12s: delivery %s / TSN %u / 0x%x (%s)\n",
                   reportConfirmationLabel(index),
                   ok ? "CONFIRMED" : "FAILED",
                   static_cast<unsigned>(confirmation.tsn),
-                  status,
-                  esp_err_to_name(status));
-    skmCycleLogAppend("Report %s: delivery %s / TSN %u / 0x%x (%s)",
-                      reportConfirmationLabel(index),
-                      ok ? "CONFIRMED" : "FAILED",
-                      static_cast<unsigned>(confirmation.tsn),
-                      status,
-                      esp_err_to_name(status));
+                  confirmation.status,
+                  esp_err_to_name(confirmation.status));
   }
-
   return explicitFailureDetected;
 }
 
-static constexpr uint32_t RTC_MAGIC = 0x534B4D32UL;  // "SKM2"
+static constexpr uint32_t RTC_MAGIC = 0x534B4D32UL;
 
 enum class LevelState : uint8_t {
   NORMAL = 0,
@@ -276,18 +243,12 @@ enum class LevelState : uint8_t {
 
 RTC_DATA_ATTR uint32_t rtcMagic = 0;
 RTC_DATA_ATTR uint8_t rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
-
-// A HIGH-open event ends the refill and must survive failed Zigbee startups.
-// The captured final float snapshot is retransmitted until all three copies
-// have been accepted by the local Zigbee stack.
 RTC_DATA_ATTR bool rtcFinalReportPending = false;
 RTC_DATA_ATTR bool rtcFinalLowClosed = false;
 RTC_DATA_ATTR bool rtcFinalHighClosed = false;
-
-// Last valid adaptive NORMAL interval retained across deep sleep.
-// Short event-only wakes can therefore skip the DS18B20 conversion.
-RTC_DATA_ATTR uint64_t rtcNormalSleepSeconds =
-    SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+RTC_DATA_ATTR bool rtcFaultReportKnown = false;
+RTC_DATA_ATTR bool rtcLastFaultReported = false;
+RTC_DATA_ATTR uint64_t rtcNormalSleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
 RTC_DATA_ATTR float rtcLastWaterTemperatureC = 20.0f;
 RTC_DATA_ATTR bool rtcNormalSleepValid = false;
 
@@ -297,15 +258,12 @@ DallasTemperature temperatureSensors(&oneWire);
 class PreloadBinary : public ZigbeeBinary {
  public:
   explicit PreloadBinary(uint8_t endpoint) : ZigbeeBinary(endpoint) {}
-
   bool preloadBinaryInput(bool value) {
     esp_zb_attribute_list_t *cluster = esp_zb_cluster_list_get_cluster(
         _cluster_list,
         ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    if (cluster == nullptr) {
-      return false;
-    }
+    if (cluster == nullptr) return false;
     return esp_zb_cluster_update_attr(
                cluster,
                ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
@@ -316,6 +274,7 @@ class PreloadBinary : public ZigbeeBinary {
 ZigbeeTempSensor zbTemperature(ZB_EP_TEMPERATURE);
 PreloadBinary zbLowLevel(ZB_EP_LOW_LEVEL);
 PreloadBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
+PreloadBinary zbSensorFault(ZB_EP_SENSOR_FAULT);
 
 struct SensorSnapshot {
   bool lowClosed = false;
@@ -340,6 +299,7 @@ struct CyclePlan {
   bool useZigbee = false;
   bool reportTemperature = false;
   bool reportFloats = false;
+  bool reportFault = false;
   uint64_t sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
   bool watchLow = false;
   bool watchHigh = false;
@@ -356,144 +316,11 @@ const char *stateName(LevelState state) {
   }
 }
 
-const char *contactState(bool closed) {
-  return closed ? "CLOSED" : "OPEN";
-}
+const char *contactState(bool closed) { return closed ? "CLOSED" : "OPEN"; }
 
-enum class BatteryAssessment : uint8_t {
-  UNAVAILABLE = 0,
-  STABILIZING,
-  FULL,
-  CHARGING,
-  STABLE,
-  DISCHARGING,
-  LOW_LEVEL,
-  CRITICAL,
-};
-
-BatteryAssessment assessBattery(const SensorSnapshot &snapshot) {
-  if (!snapshot.batteryValid) return BatteryAssessment::UNAVAILABLE;
-
-  // A truly low cell voltage remains authoritative, even while ModelGauge is
-  // learning. SOC-based alarms wait until the gauge rate becomes plausible.
-  if (snapshot.batteryVoltage < 3.35f) {
-    return BatteryAssessment::CRITICAL;
-  }
-
-  const float rate = snapshot.batteryRatePercentPerHour;
-  if (snapshot.batteryResetDetected ||
-      (snapshot.batteryRateValid && fabsf(rate) > 25.0f)) {
-    return BatteryAssessment::STABILIZING;
-  }
-  if (snapshot.batteryPercent <= 10) {
-    return BatteryAssessment::CRITICAL;
-  }
-  if (snapshot.batteryPercent <= 20 || snapshot.batteryVoltage < 3.50f) {
-    return BatteryAssessment::LOW_LEVEL;
-  }
-  if (snapshot.batteryPercent >= 95 &&
-      snapshot.batteryVoltage >= 4.10f &&
-      (!snapshot.batteryRateValid || fabsf(rate) < 1.0f)) {
-    return BatteryAssessment::FULL;
-  }
-  if (!snapshot.batteryRateValid || fabsf(rate) < 0.5f) {
-    return BatteryAssessment::STABLE;
-  }
-  return rate > 0.0f
-           ? BatteryAssessment::CHARGING
-           : BatteryAssessment::DISCHARGING;
-}
-
-const char *batteryAssessmentName(BatteryAssessment assessment) {
-  switch (assessment) {
-    case BatteryAssessment::STABILIZING: return "ESTIMATION EN COURS";
-    case BatteryAssessment::FULL: return "PLEINE";
-    case BatteryAssessment::CHARGING: return "EN CHARGE";
-    case BatteryAssessment::STABLE: return "STABLE";
-    case BatteryAssessment::DISCHARGING: return "EN DECHARGE";
-    case BatteryAssessment::LOW_LEVEL: return "FAIBLE";
-    case BatteryAssessment::CRITICAL: return "CRITIQUE";
-    default: return "INDISPONIBLE";
-  }
-}
-
-bool batteryEstimateHours(const SensorSnapshot &snapshot,
-                          float &hours,
-                          bool &untilFull) {
-  hours = 0.0f;
-  untilFull = false;
-  if (!snapshot.batteryValid || !snapshot.batteryRateValid) return false;
-
-  const BatteryAssessment assessment = assessBattery(snapshot);
-  const float rate = snapshot.batteryRatePercentPerHour;
-  if (assessment == BatteryAssessment::CHARGING &&
-      rate >= 0.5f && rate <= 25.0f) {
-    hours = (100.0f - snapshot.batterySocRaw) / rate;
-    untilFull = true;
-  } else if (assessment == BatteryAssessment::DISCHARGING &&
-             rate <= -0.5f && rate >= -25.0f) {
-    hours = snapshot.batterySocRaw / -rate;
-    untilFull = false;
-  } else {
-    return false;
-  }
-  return isfinite(hours) && hours >= 0.0f && hours <= 240.0f;
-}
-
-String batteryAlertSummary(const SensorSnapshot &snapshot) {
-  if (!snapshot.batteryValid) return String(F("unavailable"));
-  String alerts;
-  const auto add = [&](const __FlashStringHelper *label) {
-    if (alerts.length()) alerts += F(", ");
-    alerts += label;
-  };
-  if (snapshot.batteryStatus & MAX17048_STATUS_HD) add(F("low SOC"));
-  if (snapshot.batteryStatus & MAX17048_STATUS_VL) add(F("low voltage"));
-  if (snapshot.batteryStatus & MAX17048_STATUS_VH) add(F("high voltage"));
-  if (snapshot.batteryStatus & MAX17048_STATUS_VR) add(F("voltage reset"));
-  if (snapshot.batteryStatus & MAX17048_STATUS_SC) add(F("SOC change"));
-  if (snapshot.batteryStatus & MAX17048_STATUS_RI) add(F("gauge reset"));
-  return alerts.length() ? alerts : String(F("none"));
-}
-
-
-uint64_t normalSleepSecondsForTemperature(
-    const SensorSnapshot &snapshot) {
-#ifndef SKIMMERSENSE_PRODUCTION_BUILD
-  return SKIMMERSENSE_NORMAL_TIMER_SECONDS;
-#else
-  if (!snapshot.temperatureValid) {
-    return rtcNormalSleepValid
-             ? rtcNormalSleepSeconds
-             : SKIMMERSENSE_NORMAL_TIMER_SECONDS;
-  }
-
-  const float t = snapshot.waterTemperatureC;
-  uint64_t seconds;
-
-  if (t >= 28.0f)      seconds = 1800ULL;
-  else if (t >= 24.0f) seconds = 3600ULL;
-  else if (t >= 18.0f) seconds = 7200ULL;
-  else if (t >= 12.0f) seconds = 14400ULL;
-  else if (t >= 5.0f)  seconds = 21600ULL;
-  else if (t >= 3.0f)  seconds = 7200ULL;
-  else                 seconds = 1800ULL;
-
-  rtcNormalSleepSeconds = seconds;
-  rtcLastWaterTemperatureC = t;
-  rtcNormalSleepValid = true;
-
-  return seconds;
-#endif
-}
-
-const char *wakeCauseName(esp_sleep_wakeup_cause_t cause) {
-  switch (cause) {
-    case ESP_SLEEP_WAKEUP_TIMER: return "timer";
-    case ESP_SLEEP_WAKEUP_EXT1: return "EXT1 GPIO";
-    case ESP_SLEEP_WAKEUP_UNDEFINED: return "cold boot/reset";
-    default: return "other";
-  }
+uint64_t currentExt1Mask() {
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) return 0;
+  return esp_sleep_get_ext1_wakeup_status();
 }
 
 void releaseRtcWakePins() {
@@ -502,33 +329,12 @@ void releaseRtcWakePins() {
   rtc_gpio_deinit(static_cast<gpio_num_t>(PIN_MAX17048_INT));
 }
 
-uint64_t currentExt1Mask() {
-  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT1) {
-    return 0;
-  }
-  return esp_sleep_get_ext1_wakeup_status();
-}
-
-void printWakeReason() {
-  const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  Serial.printf("Wake cause: %s\n", wakeCauseName(cause));
-  if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-    const uint64_t mask = currentExt1Mask();
-    Serial.printf("EXT1 wake mask: 0x%llX", static_cast<unsigned long long>(mask));
-    if (mask & (1ULL << PIN_FLOAT_LOW)) Serial.print(" LOW-float");
-    if (mask & (1ULL << PIN_FLOAT_HIGH)) Serial.print(" HIGH-float");
-    if (mask & (1ULL << PIN_MAX17048_INT)) Serial.print(" MAX17048-ALRT");
-    Serial.println();
-  }
-}
-
 bool readRegister16(uint8_t reg, uint16_t &value) {
   Wire.beginTransmission(MAX17048_I2C_ADDRESS);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;
   if (Wire.requestFrom(MAX17048_I2C_ADDRESS, static_cast<uint8_t>(2)) != 2) return false;
-  value = (static_cast<uint16_t>(Wire.read()) << 8) |
-          static_cast<uint16_t>(Wire.read());
+  value = (static_cast<uint16_t>(Wire.read()) << 8) | static_cast<uint16_t>(Wire.read());
   return true;
 }
 
@@ -541,110 +347,57 @@ bool writeRegister16(uint8_t reg, uint16_t value) {
 }
 
 bool configureMax17048Alerts() {
-  uint16_t config = 0;
-  uint16_t voltageAlert = 0;
+  uint16_t config = 0, voltageAlert = 0;
   if (!readRegister16(MAX17048_REG_CONFIG, config) ||
-      !readRegister16(MAX17048_REG_VALRT, voltageAlert)) {
-    Serial.println("MAX17048 alert configuration: register read failed");
-    return false;
-  }
-
-  // CONFIG.ATHD is encoded as 32 - percentage in the low five bits.
-  const uint16_t socThreshold =
-      static_cast<uint16_t>(32U - SKIMMERSENSE_MAX17048_ALERT_PERCENT);
-  const uint16_t wantedConfig =
-      static_cast<uint16_t>((config & 0xFFE0U) | socThreshold);
-
-  // VALRT.MIN is the high byte in 20 mV units. Preserve VALRT.MAX.
-  const uint16_t lowVoltageUnits = static_cast<uint16_t>(
-      (SKIMMERSENSE_MAX17048_LOW_VOLTAGE_MV + 10U) / 20U);
-  const uint16_t wantedVoltageAlert = static_cast<uint16_t>(
-      (lowVoltageUnits << 8) | (voltageAlert & 0x00FFU));
-
+      !readRegister16(MAX17048_REG_VALRT, voltageAlert)) return false;
+  const uint16_t socThreshold = static_cast<uint16_t>(32U - SKIMMERSENSE_MAX17048_ALERT_PERCENT);
+  const uint16_t wantedConfig = static_cast<uint16_t>((config & 0xFFE0U) | socThreshold);
+  const uint16_t lowVoltageUnits = static_cast<uint16_t>((SKIMMERSENSE_MAX17048_LOW_VOLTAGE_MV + 10U) / 20U);
+  const uint16_t wantedVoltageAlert = static_cast<uint16_t>((lowVoltageUnits << 8) | (voltageAlert & 0x00FFU));
   bool ok = true;
-  if (wantedConfig != config) {
-    ok &= writeRegister16(MAX17048_REG_CONFIG, wantedConfig);
-  }
-  if (wantedVoltageAlert != voltageAlert) {
-    ok &= writeRegister16(MAX17048_REG_VALRT, wantedVoltageAlert);
-  }
-
-  Serial.printf(
-      "MAX17048 alerts: SOC %u %% / low voltage %.2f V / configuration %s\n",
-      static_cast<unsigned>(SKIMMERSENSE_MAX17048_ALERT_PERCENT),
-      static_cast<double>(SKIMMERSENSE_MAX17048_LOW_VOLTAGE_MV) / 1000.0,
-      ok ? "OK" : "FAILED");
+  if (wantedConfig != config) ok &= writeRegister16(MAX17048_REG_CONFIG, wantedConfig);
+  if (wantedVoltageAlert != voltageAlert) ok &= writeRegister16(MAX17048_REG_VALRT, wantedVoltageAlert);
   return ok;
 }
 
 void acknowledgeMax17048Alert() {
-  uint16_t rawStatus = 0;
-  uint16_t config = 0;
+  uint16_t rawStatus = 0, config = 0;
   if (!readRegister16(MAX17048_REG_STATUS, rawStatus) ||
-      !readRegister16(MAX17048_REG_CONFIG, config)) {
-    return;
-  }
-
-  const uint8_t status = static_cast<uint8_t>(rawStatus >> 8);
+      !readRegister16(MAX17048_REG_CONFIG, config)) return;
   const uint8_t alertFlags = static_cast<uint8_t>(
       MAX17048_STATUS_SC | MAX17048_STATUS_HD | MAX17048_STATUS_VR |
       MAX17048_STATUS_VL | MAX17048_STATUS_VH | MAX17048_STATUS_RI);
-  if (status & alertFlags) {
-    // Preserve STATUS.EnVR and reserved bits; clear every captured alert
-    // descriptor after it has been copied into SensorSnapshot.
-    writeRegister16(MAX17048_REG_STATUS,
-                    rawStatus &
-                        ~(static_cast<uint16_t>(alertFlags) << 8));
-  }
-  if (config & MAX17048_CONFIG_ALRT) {
+  writeRegister16(MAX17048_REG_STATUS,
+                  rawStatus & ~(static_cast<uint16_t>(alertFlags) << 8));
+  if (config & MAX17048_CONFIG_ALRT)
     writeRegister16(MAX17048_REG_CONFIG, config & ~MAX17048_CONFIG_ALRT);
-  }
 }
 
 float readWaterTemperatureC() {
   pinMode(PIN_DS18B20_POWER, OUTPUT);
   digitalWrite(PIN_DS18B20_POWER, HIGH);
   delay(20);
-
   temperatureSensors.begin();
-  if (temperatureSensors.getDeviceCount() == 0) {
-    pinMode(PIN_DS18B20_DATA, INPUT);
-    digitalWrite(PIN_DS18B20_POWER, LOW);
-    return DEVICE_DISCONNECTED_C;
-  }
-
+  if (temperatureSensors.getDeviceCount() == 0) return DEVICE_DISCONNECTED_C;
   temperatureSensors.setResolution(10);
   temperatureSensors.requestTemperatures();
   const float value = temperatureSensors.getTempCByIndex(0);
-
-  pinMode(PIN_DS18B20_DATA, INPUT);
   digitalWrite(PIN_DS18B20_POWER, LOW);
   return value;
 }
 
 SensorSnapshot readBaseSensorSnapshot(bool manageAlerts = true) {
   SensorSnapshot snapshot;
-
   releaseRtcWakePins();
   pinMode(PIN_FLOAT_LOW, INPUT_PULLUP);
   pinMode(PIN_FLOAT_HIGH, INPUT_PULLUP);
   pinMode(PIN_MAX17048_INT, INPUT_PULLUP);
-  pinMode(PIN_DS18B20_POWER, OUTPUT);
-  digitalWrite(PIN_DS18B20_POWER, LOW);
-  pinMode(PIN_DS18B20_DATA, INPUT);
-
   snapshot.lowClosed = digitalRead(PIN_FLOAT_LOW) == LOW;
   snapshot.highClosed = digitalRead(PIN_FLOAT_HIGH) == LOW;
   snapshot.maxIntLow = digitalRead(PIN_MAX17048_INT) == LOW;
-
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(100000);
-
-  uint16_t rawVcell = 0;
-  uint16_t rawSoc = 0;
-  uint16_t rawCrate = 0;
-  uint16_t rawStatus = 0;
-  uint16_t version = 0;
+  uint16_t rawVcell = 0, rawSoc = 0, rawCrate = 0, rawStatus = 0, version = 0;
   Wire.beginTransmission(MAX17048_I2C_ADDRESS);
   if (Wire.endTransmission() == 0 &&
       readRegister16(MAX17048_REG_VERSION, version) &&
@@ -654,30 +407,18 @@ SensorSnapshot readBaseSensorSnapshot(bool manageAlerts = true) {
     snapshot.maxVersion = version;
     snapshot.batteryVoltage = static_cast<float>(rawVcell) * 78.125f / 1000000.0f;
     snapshot.batterySocRaw = static_cast<float>(rawSoc) / 256.0f;
-
-    float clampedSoc = snapshot.batterySocRaw;
-    if (clampedSoc < 0.0f) clampedSoc = 0.0f;
-    if (clampedSoc > 100.0f) clampedSoc = 100.0f;
+    float clampedSoc = constrain(snapshot.batterySocRaw, 0.0f, 100.0f);
     snapshot.batteryPercent = static_cast<uint8_t>(clampedSoc + 0.5f);
-
-    int voltage100mV = static_cast<int>(snapshot.batteryVoltage * 10.0f + 0.5f);
-    if (voltage100mV < 0) voltage100mV = 0;
-    if (voltage100mV > 255) voltage100mV = 255;
-    snapshot.batteryVoltageZcl = static_cast<uint8_t>(voltage100mV);
-
+    snapshot.batteryVoltageZcl = static_cast<uint8_t>(constrain(static_cast<int>(snapshot.batteryVoltage * 10.0f + 0.5f), 0, 255));
     if (readRegister16(MAX17048_REG_CRATE, rawCrate)) {
       snapshot.batteryRateValid = true;
-      snapshot.batteryRatePercentPerHour =
-          static_cast<float>(static_cast<int16_t>(rawCrate)) *
-          MAX17048_CRATE_LSB_PERCENT_PER_HOUR;
+      snapshot.batteryRatePercentPerHour = static_cast<float>(static_cast<int16_t>(rawCrate)) * MAX17048_CRATE_LSB_PERCENT_PER_HOUR;
     }
     if (readRegister16(MAX17048_REG_STATUS, rawStatus)) {
       snapshot.batteryStatus = static_cast<uint8_t>(rawStatus >> 8);
-      snapshot.batteryResetDetected =
-          (snapshot.batteryStatus & MAX17048_STATUS_RI) != 0;
+      snapshot.batteryResetDetected = (snapshot.batteryStatus & MAX17048_STATUS_RI) != 0;
     }
   }
-
   if (snapshot.batteryValid && manageAlerts) {
     configureMax17048Alerts();
     acknowledgeMax17048Alert();
@@ -686,228 +427,58 @@ SensorSnapshot readBaseSensorSnapshot(bool manageAlerts = true) {
 }
 
 void readTemperatureIntoSnapshot(SensorSnapshot &snapshot) {
-  snapshot.temperatureValid = false;
-
   const float temperature = readWaterTemperatureC();
-
-  if (temperature != DEVICE_DISCONNECTED_C &&
-      temperature > -55.0f &&
-      temperature < 85.0f) {
-    snapshot.temperatureValid = true;
-    snapshot.waterTemperatureC = temperature;
-  }
+  snapshot.temperatureValid = temperature != DEVICE_DISCONNECTED_C &&
+                              temperature > -55.0f && temperature < 85.0f;
+  if (snapshot.temperatureValid) snapshot.waterTemperatureC = temperature;
 }
 
 bool configureZigbeeEndpoints(const SensorSnapshot &snapshot) {
   bool ok = true;
-
   zbTemperature.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   zbTemperature.setMinMaxValue(-10, 60);
   zbTemperature.setDefaultValue(snapshot.waterTemperatureC);
   zbTemperature.setTolerance(1);
-
-  // Create and preload the standard Power Configuration server cluster before
-  // Zigbee.begin(). Runtime attribute setters previously triggered a ZBOSS
-  // assertion on ESP32-C6, so battery values are never mutated after start.
-  // Battery percentage uses Zigbee half-percent units internally; the Arduino
-  // wrapper performs that conversion here. Voltage uses 100 mV units.
   if (snapshot.batteryValid) {
-    ok &= zbTemperature.setPowerSource(
-        ZB_POWER_SOURCE_BATTERY,
-        snapshot.batteryPercent,
-        snapshot.batteryVoltageZcl);
-  } else {
-    Serial.println(
-        "Battery cluster omitted: MAX17048 snapshot unavailable.");
+    ok &= zbTemperature.setPowerSource(ZB_POWER_SOURCE_BATTERY,
+                                       snapshot.batteryPercent,
+                                       snapshot.batteryVoltageZcl);
   }
-
   zbLowLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   ok &= zbLowLevel.addBinaryInput();
   ok &= zbLowLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
   ok &= zbLowLevel.setBinaryInputDescription("Low Level");
   ok &= zbLowLevel.preloadBinaryInput(snapshot.lowClosed);
-
   zbHighLevel.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
   ok &= zbHighLevel.addBinaryInput();
   ok &= zbHighLevel.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
   ok &= zbHighLevel.setBinaryInputDescription("High Level");
   ok &= zbHighLevel.preloadBinaryInput(snapshot.highClosed);
-
+  const bool sensorFault = snapshot.lowClosed && !snapshot.highClosed;
+  zbSensorFault.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
+  ok &= zbSensorFault.addBinaryInput();
+  ok &= zbSensorFault.setBinaryInputApplication(BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
+  ok &= zbSensorFault.setBinaryInputDescription("Sensor Fault");
+  ok &= zbSensorFault.preloadBinaryInput(sensorFault);
   ok &= Zigbee.addEndpoint(&zbTemperature);
   ok &= Zigbee.addEndpoint(&zbLowLevel);
   ok &= Zigbee.addEndpoint(&zbHighLevel);
+  ok &= Zigbee.addEndpoint(&zbSensorFault);
   return ok;
 }
 
-void configureZigbeeTxPower() {
-  int8_t beforeDbm = 0;
-  int8_t afterDbm = 0;
-
-  if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
-    Serial.println("Zigbee TX power: lock unavailable; keeping stack default");
-    skmCycleLogAppend("Zigbee TX power: lock unavailable; stack default kept");
-    return;
-  }
-
-  esp_zb_get_tx_power(&beforeDbm);
-  if (beforeDbm < SKIMMERSENSE_ZIGBEE_TX_POWER_DBM) {
-    esp_zb_set_tx_power(SKIMMERSENSE_ZIGBEE_TX_POWER_DBM);
-  }
-  esp_zb_get_tx_power(&afterDbm);
-  esp_zb_lock_release();
-
-  Serial.printf("Zigbee TX power: %d dBm -> %d dBm%s\n",
-                static_cast<int>(beforeDbm),
-                static_cast<int>(afterDbm),
-                beforeDbm < SKIMMERSENSE_ZIGBEE_TX_POWER_DBM
-                    ? " (target applied)"
-                    : " (stack value retained)");
-  skmCycleLogAppend("Zigbee TX power: %d dBm -> %d dBm%s",
-                    static_cast<int>(beforeDbm),
-                    static_cast<int>(afterDbm),
-                    beforeDbm < SKIMMERSENSE_ZIGBEE_TX_POWER_DBM
-                        ? " (target applied)"
-                        : " (stack value retained)");
-}
-
-bool logZigbeeParentReception(const char *phase) {
-  esp_zb_nwk_info_iterator_t iterator = ESP_ZB_NWK_INFO_ITERATOR_INIT;
-  esp_zb_nwk_neighbor_info_t neighbor{};
-  bool found = false;
-  int8_t parentRssiDbm = 0;
-  uint8_t parentLqi = 0;
-  uint16_t parentShortAddress = 0xFFFF;
-
-  if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
-    Serial.printf("Zigbee parent RX (%s): unavailable (stack lock)\n", phase);
-    skmCycleLogAppend("Zigbee parent RX (%s): unavailable (stack lock)", phase);
-    return false;
-  }
-
-  while (esp_zb_nwk_get_next_neighbor(&iterator, &neighbor) == ESP_OK) {
-    if (neighbor.relationship == ESP_ZB_NWK_RELATIONSHIP_PARENT) {
-      parentRssiDbm = neighbor.rssi;
-      parentLqi = neighbor.lqi;
-      parentShortAddress = neighbor.short_addr;
-      found = true;
-      break;
-    }
-  }
-  esp_zb_lock_release();
-
-  if (!found) {
-    Serial.printf("Zigbee parent RX (%s): unavailable on this wake\n", phase);
-    skmCycleLogAppend("Zigbee parent RX (%s): unavailable on this wake", phase);
-    return false;
-  }
-
-  Serial.printf("Zigbee parent RX (%s): RSSI %d dBm / LQI %u / short 0x%04X\n",
-                phase,
-                static_cast<int>(parentRssiDbm),
-                static_cast<unsigned>(parentLqi),
-                static_cast<unsigned>(parentShortAddress));
-  skmCycleLogAppend("Zigbee parent RX (%s): RSSI %d dBm / LQI %u / short 0x%04X",
-                    phase,
-                    static_cast<int>(parentRssiDbm),
-                    static_cast<unsigned>(parentLqi),
-                    static_cast<unsigned>(parentShortAddress));
-  return true;
-}
-
-void scheduleZigbeeRecovery(CyclePlan &plan, const char *failureStage) {
-  const uint64_t plannedSleepSeconds = plan.sleepSeconds;
-  if (plan.sleepSeconds > SKIMMERSENSE_ZIGBEE_RETRY_SECONDS) {
-    plan.sleepSeconds = SKIMMERSENSE_ZIGBEE_RETRY_SECONDS;
-  }
-
-  Serial.printf(
-      "Zigbee recovery after %s: retry in %llu s (planned interval was %llu s)\n",
-      failureStage,
-      static_cast<unsigned long long>(plan.sleepSeconds),
-      static_cast<unsigned long long>(plannedSleepSeconds));
-  skmCycleLogAppend(
-      "Zigbee recovery after %s: retry in %llu s (planned interval was %llu s)",
-      failureStage,
-      static_cast<unsigned long long>(plan.sleepSeconds),
-      static_cast<unsigned long long>(plannedSleepSeconds));
-}
-
-bool startZigbee(bool fastPollForInterview) {
+bool startZigbee(bool) {
   esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-
-  // Adaptive NORMAL sleep can reach 6 hours. Keep the Zigbee child
-  // relationship alive much longer than the default sleepy-device timeout.
-  zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout =
-      ESP_ZB_ED_AGING_TIMEOUT_2048MIN;
-  zigbeeConfig.nwk_cfg.zed_cfg.keep_alive =
-      fastPollForInterview
-          ? SKIMMERSENSE_ZIGBEE_INTERVIEW_POLL_MS
-          : SKIMMERSENSE_ZIGBEE_NORMAL_POLL_MS;
-  Serial.printf("Zigbee sleepy poll interval: %lu ms%s\n",
-                static_cast<unsigned long>(
-                    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive),
-                fastPollForInterview ? " (cold-boot interview)" : "");
-  skmCycleLogAppend("Zigbee sleepy poll interval: %lu ms%s",
-                    static_cast<unsigned long>(
-                        zigbeeConfig.nwk_cfg.zed_cfg.keep_alive),
-                    fastPollForInterview ? " (cold-boot interview)" : "");
+  zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_2048MIN;
+  zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = SKIMMERSENSE_ZIGBEE_NORMAL_POLL_MS;
   Zigbee.setTimeout(SKIMMERSENSE_ZIGBEE_BEGIN_TIMEOUT_MS);
-
-  const uint32_t primaryChannelMask = 1UL << SKIMMERSENSE_ZIGBEE_CHANNEL;
-  Zigbee.setPrimaryChannelMask(primaryChannelMask);
-  Serial.printf("Zigbee primary channel: %u (mask 0x%08lX)\n",
-                static_cast<unsigned>(SKIMMERSENSE_ZIGBEE_CHANNEL),
-                static_cast<unsigned long>(primaryChannelMask));
-  skmCycleLogAppend("Zigbee primary channel: %u (mask 0x%08lX)",
-                    static_cast<unsigned>(SKIMMERSENSE_ZIGBEE_CHANNEL),
-                    static_cast<unsigned long>(primaryChannelMask));
-
-  Serial.println("Starting Zigbee sleepy End Device...");
-  skmCycleLogAppend("Zigbee: starting sleepy End Device");
-  const uint32_t beginStartedAt = millis();
-  if (!Zigbee.begin(&zigbeeConfig, false)) {
-    const uint32_t elapsed = millis() - beginStartedAt;
-    Serial.printf("Zigbee begin failed after %lu ms\n",
-                  static_cast<unsigned long>(elapsed));
-    skmCycleLogAppend("Zigbee: begin FAILED after %lu ms",
-                      static_cast<unsigned long>(elapsed));
-    return false;
-  }
-  const uint32_t beginElapsed = millis() - beginStartedAt;
-  Serial.printf("Zigbee stack started in %lu ms\n",
-                static_cast<unsigned long>(beginElapsed));
-  skmCycleLogAppend("Zigbee: stack started in %lu ms",
-                    static_cast<unsigned long>(beginElapsed));
-
-  // ZBOSS is initialized now; set power before network reconnection.
-  configureZigbeeTxPower();
-
-  Serial.print("Waiting for Zigbee network");
+  Zigbee.setPrimaryChannelMask(1UL << SKIMMERSENSE_ZIGBEE_CHANNEL);
+  if (!Zigbee.begin(&zigbeeConfig, false)) return false;
   const uint32_t startedAt = millis();
-  while (!Zigbee.connected() && millis() - startedAt < SKIMMERSENSE_ZIGBEE_WAIT_MS) {
-    Serial.print(".");
-    delay(100);
-  }
-  Serial.println();
-
-  if (!Zigbee.connected()) {
-    const uint32_t elapsed = millis() - startedAt;
-    Serial.printf("Zigbee reconnect timeout after %lu ms\n",
-                  static_cast<unsigned long>(elapsed));
-    skmCycleLogAppend("Zigbee: reconnect TIMEOUT after %lu ms",
-                      static_cast<unsigned long>(elapsed));
-    return false;
-  }
-
-  const uint32_t reconnectElapsed = millis() - startedAt;
-  Serial.printf("Zigbee connected in %lu ms after stack start!\n",
-                static_cast<unsigned long>(reconnectElapsed));
-  skmCycleLogAppend("Zigbee: connected in %lu ms after stack start",
-                    static_cast<unsigned long>(reconnectElapsed));
-
+  while (!Zigbee.connected() && millis() - startedAt < SKIMMERSENSE_ZIGBEE_WAIT_MS) delay(100);
+  if (!Zigbee.connected()) return false;
   resetZigbeeReportConfirmations();
-  esp_zb_zcl_command_send_status_handler_register(
-      zigbeeCommandSendStatusCallback);
+  esp_zb_zcl_command_send_status_handler_register(zigbeeCommandSendStatusCallback);
   return true;
 }
 
@@ -918,86 +489,47 @@ bool sendSafeReport(uint8_t endpoint, uint16_t clusterId, uint16_t attributeId, 
   report.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
   report.clusterID = clusterId;
   report.zcl_basic_cmd.src_endpoint = endpoint;
-  report.manuf_specific = 0x00U;
-  report.dis_default_resp = 0x00U;
-
   Serial.printf("Report %-12s: queue...\n", label);
   expectZigbeeReportConfirmation(endpoint);
-  if (!esp_zb_lock_acquire(portMAX_DELAY)) {
-    Serial.printf("Report %-12s: Zigbee lock FAILED\n", label);
-    skmCycleLogAppend("Report %s: Zigbee lock FAILED", label);
-    return false;
-  }
+  if (!esp_zb_lock_acquire(portMAX_DELAY)) return false;
   const esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report);
   esp_zb_lock_release();
-
-  if (err != ESP_OK) {
-    Serial.printf("Report %-12s: FAILED 0x%x (%s)\n", label, err, esp_err_to_name(err));
-    skmCycleLogAppend("Report %s: FAILED 0x%x (%s)",
-                      label, err, esp_err_to_name(err));
-    return false;
-  }
+  if (err != ESP_OK) return false;
   Serial.printf("Report %-12s: queued OK\n", label);
-  skmCycleLogAppend("Report %s: queued OK", label);
   return true;
 }
 
 bool armOppositeLevelWake(uint8_t pin, bool currentHigh, const char *label) {
   const gpio_num_t gpio = static_cast<gpio_num_t>(pin);
-  if (!esp_sleep_is_valid_wakeup_gpio(gpio)) {
-    Serial.printf("Wake pin %s GPIO%u invalid\n", label, pin);
-    return false;
-  }
-  if (rtc_gpio_init(gpio) != ESP_OK ||
-      rtc_gpio_pulldown_dis(gpio) != ESP_OK ||
-      rtc_gpio_pullup_en(gpio) != ESP_OK) {
-    Serial.printf("RTC pull-up setup failed for %s GPIO%u\n", label, pin);
-    return false;
-  }
-
+  if (!esp_sleep_is_valid_wakeup_gpio(gpio)) return false;
+  rtc_gpio_init(gpio);
+  rtc_gpio_pulldown_dis(gpio);
+  rtc_gpio_pullup_en(gpio);
   const esp_sleep_ext1_wakeup_mode_t mode =
       currentHigh ? ESP_EXT1_WAKEUP_ANY_LOW : ESP_EXT1_WAKEUP_ANY_HIGH;
   const esp_err_t err = esp_sleep_enable_ext1_wakeup_io(1ULL << pin, mode);
-  if (err != ESP_OK) {
-    Serial.printf("Failed to arm %s GPIO%u: %s\n", label, pin, esp_err_to_name(err));
-    return false;
-  }
-
-  Serial.printf("Wake %s GPIO%u: %s -> wake on %s\n",
-                label,
-                pin,
+  if (err != ESP_OK) return false;
+  Serial.printf("Wake %s GPIO%u: %s -> wake on %s\n", label, pin,
                 currentHigh ? "HIGH" : "LOW",
                 currentHigh ? "LOW" : "HIGH");
   return true;
 }
 
 LevelState loadState(esp_sleep_wakeup_cause_t cause) {
-  const bool rtcInvalid =
-      rtcMagic != RTC_MAGIC ||
+  const bool rtcInvalid = rtcMagic != RTC_MAGIC ||
       rtcStateRaw > static_cast<uint8_t>(LevelState::WAIT_HIGH);
-
   if (rtcInvalid) {
     rtcMagic = RTC_MAGIC;
     rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
     rtcFinalReportPending = false;
-    rtcFinalLowClosed = false;
-    rtcFinalHighClosed = false;
-    rtcNormalSleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
-    rtcLastWaterTemperatureC = 20.0f;
-    rtcNormalSleepValid = false;
+    rtcFaultReportKnown = false;
+    rtcLastFaultReported = false;
     return LevelState::NORMAL;
   }
-
   if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
-    // Reset the state machine after a cold/software boot, but preserve a
-    // valid pending final report when RTC memory itself survived the reset.
     rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
-    rtcNormalSleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
-    rtcLastWaterTemperatureC = 20.0f;
-    rtcNormalSleepValid = false;
     return LevelState::NORMAL;
   }
-
   return static_cast<LevelState>(rtcStateRaw);
 }
 
@@ -1009,30 +541,24 @@ CyclePlan makePlan(LevelState state,
   const bool timerWake = cause == ESP_SLEEP_WAKEUP_TIMER;
   const bool coldBoot = cause == ESP_SLEEP_WAKEUP_UNDEFINED;
   const bool maxWake = (extMask & (1ULL << PIN_MAX17048_INT)) != 0;
-
   switch (state) {
     case LevelState::NORMAL:
       if (snapshot.lowClosed && !snapshot.highClosed) {
-        plan.nextState = LevelState::NORMAL;
         plan.useZigbee = true;
         plan.reportTemperature = true;
-        plan.reportFloats = true;
-        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+        plan.reportFault = true;
         plan.watchLow = true;
         plan.watchHigh = true;
         plan.watchMax = true;
-        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish fault state";
+        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish SENSOR FAULT only";
       } else if (snapshot.lowClosed) {
         plan.nextState = LevelState::LOW_PENDING;
         plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
         plan.watchLow = true;
         plan.reason = "LOW closed -> continuous confirmation; wake if LOW reopens";
       } else {
-        plan.nextState = LevelState::NORMAL;
-        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
         plan.watchLow = true;
         plan.watchMax = true;
-        plan.reason = "normal monitoring: LOW + MAX17048 wake armed";
         plan.useZigbee = coldBoot || timerWake;
         plan.reportTemperature = plan.useZigbee;
         plan.reportFloats = plan.useZigbee;
@@ -1040,15 +566,11 @@ CyclePlan makePlan(LevelState state,
           plan.useZigbee = true;
           plan.reportTemperature = false;
           plan.reportFloats = false;
-          plan.reason = "MAX17048 alert -> immediate battery report";
         }
       }
       break;
-
     case LevelState::LOW_PENDING:
       if (!snapshot.lowClosed) {
-        plan.nextState = LevelState::NORMAL;
-        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
         plan.watchLow = true;
         plan.watchMax = true;
         plan.reason = "LOW reopened during confirmation -> rejected as wave/bather motion";
@@ -1056,177 +578,86 @@ CyclePlan makePlan(LevelState state,
         plan.nextState = LevelState::LOW_PENDING;
         plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
         plan.watchLow = true;
-        plan.reason = "LOW confirmation interrupted -> restart full confirmation window";
       } else if (!snapshot.highClosed) {
-        plan.nextState = LevelState::NORMAL;
         plan.useZigbee = true;
         plan.reportTemperature = true;
-        plan.reportFloats = true;
-        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
+        plan.reportFault = true;
         plan.watchLow = true;
         plan.watchHigh = true;
         plan.watchMax = true;
-        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN after continuous confirmation -> publish fault state";
+        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN after confirmation -> publish SENSOR FAULT only";
       } else {
         plan.nextState = LevelState::WAIT_HIGH;
         plan.useZigbee = true;
         plan.reportTemperature = true;
         plan.reportFloats = true;
-        plan.sleepSeconds = SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS;
         plan.watchHigh = true;
         plan.watchMax = true;
+        plan.sleepSeconds = SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS;
         plan.reason = "LOW continuously confirmed -> publish ON/ON, then ignore LOW and watch HIGH";
       }
       break;
-
     case LevelState::WAIT_HIGH:
       if (!snapshot.highClosed) {
-        plan.nextState = LevelState::NORMAL;
         plan.useZigbee = true;
         plan.reportTemperature = true;
         plan.reportFloats = true;
-        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
         plan.watchLow = true;
         plan.watchMax = true;
         plan.reason = "HIGH opened -> publish final float states and return NORMAL";
       } else {
         plan.nextState = LevelState::WAIT_HIGH;
-        plan.sleepSeconds = SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS;
         plan.watchHigh = true;
         plan.watchMax = true;
-        plan.reason = "waiting for HIGH to open; LOW transitions intentionally ignored";
+        plan.sleepSeconds = SKIMMERSENSE_WAIT_HIGH_TIMER_SECONDS;
         if (timerWake) {
           plan.useZigbee = true;
           plan.reportTemperature = true;
-          plan.reportFloats = false;
         }
         if (maxWake) {
           plan.useZigbee = true;
           plan.reportTemperature = false;
-          plan.reportFloats = false;
-          plan.reason =
-              "MAX17048 alert while WAIT_HIGH -> battery report; continue watching HIGH";
         }
       }
       break;
   }
-
-  // Always announce a cold production boot. When LOW still needs the
-  // anti-wave confirmation, publish temperature only: reporting raw floats
-  // here could look like a validated refill request to Home Assistant.
   if (coldBoot && !plan.useZigbee) {
     plan.useZigbee = true;
     plan.reportTemperature = true;
+  }
+  const bool sensorFault = snapshot.lowClosed && !snapshot.highClosed;
+  if (plan.useZigbee) plan.reportFault = true;
+  if (rtcFaultReportKnown && rtcLastFaultReported && !sensorFault && !plan.useZigbee) {
+    plan.useZigbee = true;
+    plan.reportFault = true;
+    plan.reportTemperature = false;
     plan.reportFloats = false;
-    plan.reason =
-        "LOW closed -> confirmation; cold-boot Zigbee heartbeat (temperature only)";
+    plan.reason = "sensor state coherent again -> immediate SENSOR FAULT OFF";
   }
-
-  // Adaptive periodic NORMAL refresh is used only when the LOW
-  // float is OPEN. Fault states and LOW-confirmation logic keep their
-  // conservative fixed timers. GPIO wake remains immediate.
-  if (plan.nextState == LevelState::NORMAL && !snapshot.lowClosed) {
-    plan.sleepSeconds = normalSleepSecondsForTemperature(snapshot);
-  }
-
   return plan;
 }
 
 void applyPendingFinalReport(CyclePlan &plan) {
   if (!rtcFinalReportPending) return;
-
   plan.nextState = LevelState::NORMAL;
   plan.useZigbee = true;
   plan.reportFloats = true;
+  plan.reportFault = true;
   plan.watchLow = true;
-  plan.watchHigh = false;
   plan.watchMax = true;
-  plan.reason =
-      "pending refill-completion snapshot -> retry three LOW/HIGH copies";
+  plan.reason = "pending refill-completion snapshot -> retry three LOW/HIGH copies";
 }
 
 [[noreturn]] void enterPlannedSleep(CyclePlan plan) {
-  const LevelState previousState =
-    static_cast<LevelState>(rtcStateRaw);
-
-  pinMode(PIN_DS18B20_DATA, INPUT);
-  digitalWrite(PIN_DS18B20_POWER, LOW);
-
-  // If LOW is CLOSED before sleeping in NORMAL, start/restart confirmation.
-  // Exclude WAIT_HIGH -> NORMAL because LOW may legitimately still be CLOSED
-  // when HIGH opens at the end of a refill.
-  if (plan.nextState == LevelState::NORMAL &&
-      previousState != LevelState::WAIT_HIGH &&
-      plan.watchLow &&
-      digitalRead(PIN_FLOAT_LOW) == LOW &&
-      digitalRead(PIN_FLOAT_HIGH) == LOW) {
-
-    Serial.println("LOW CLOSED before sleep -> starting/restarting continuous confirmation.");
-
-    plan.nextState = LevelState::LOW_PENDING;
-    plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
-    plan.watchLow = true;
-    plan.watchHigh = false;
-    plan.watchMax = false;
-  }
-
-  // HIGH can open while the Zigbee cycle is still awake. If that happens in
-  // WAIT_HIGH, do not arm the opposite edge and wait for the long fallback.
-  // Force a one-second timer resample so the next boot publishes the fresh
-  // LOW/HIGH state and returns to NORMAL.
-  if (plan.nextState == LevelState::WAIT_HIGH && plan.watchHigh &&
-      digitalRead(PIN_FLOAT_HIGH) == HIGH) {
-    Serial.println("HIGH became OPEN before sleep -> immediate 1 s resample.");
-    plan.sleepSeconds = 1;
-    plan.watchLow = false;
-    plan.watchHigh = false;
-    plan.watchMax = false;
-  }
-
   rtcMagic = RTC_MAGIC;
   rtcStateRaw = static_cast<uint8_t>(plan.nextState);
-
   esp_sleep_disable_ext1_wakeup_io(0);
-  bool wakeOk = true;
-
-  if (plan.watchLow) {
-    const bool high = digitalRead(PIN_FLOAT_LOW) == HIGH;
-    wakeOk &= armOppositeLevelWake(PIN_FLOAT_LOW, high, "LOW-float");
-  }
-  if (plan.watchHigh) {
-    const bool high = digitalRead(PIN_FLOAT_HIGH) == HIGH;
-    wakeOk &= armOppositeLevelWake(PIN_FLOAT_HIGH, high, "HIGH-float");
-  }
-  if (plan.watchMax) {
-    const bool high = digitalRead(PIN_MAX17048_INT) == HIGH;
-    wakeOk &= armOppositeLevelWake(PIN_MAX17048_INT, high, "MAX17048-ALRT");
-  }
-
-  const esp_err_t timerErr = esp_sleep_enable_timer_wakeup(plan.sleepSeconds * 1000000ULL);
-  if (timerErr != ESP_OK) {
-    Serial.printf("Failed to arm timer wake: %s\n", esp_err_to_name(timerErr));
-  }
-
+  if (plan.watchLow) armOppositeLevelWake(PIN_FLOAT_LOW, digitalRead(PIN_FLOAT_LOW) == HIGH, "LOW-float");
+  if (plan.watchHigh) armOppositeLevelWake(PIN_FLOAT_HIGH, digitalRead(PIN_FLOAT_HIGH) == HIGH, "HIGH-float");
+  if (plan.watchMax) armOppositeLevelWake(PIN_MAX17048_INT, digitalRead(PIN_MAX17048_INT) == HIGH, "MAX17048-ALRT");
+  esp_sleep_enable_timer_wakeup(plan.sleepSeconds * 1000000ULL);
   Serial.printf("Next state: %s\n", stateName(plan.nextState));
-  Serial.printf("Deep sleep: %llu s | GPIO wake %s\n",
-                static_cast<unsigned long long>(plan.sleepSeconds),
-                wakeOk ? "armed as planned" : "PARTIAL/FAILED");
-  Serial.println("Going to deep sleep now.");
-  skmCycleLogAppend("Next state: %s", stateName(plan.nextState));
-  skmCycleLogAppend("Deep sleep: %llu s / GPIO wake %s",
-                    static_cast<unsigned long long>(plan.sleepSeconds),
-                    wakeOk ? "armed as planned" : "PARTIAL/FAILED");
-  const bool captureRequested = skmCycleCaptureRequested();
-  if (captureRequested) {
-    skmCycleLogAppend("Persistent fifty-wake capture: wake requested");
-  }
-  skmCycleLogComplete();
-  if (captureRequested) {
-    const bool captureSaved = skmPersistCycleLogIfRequested();
-    Serial.printf("Persistent wake capture: %s | %u wake(s) remaining\n",
-                  captureSaved ? "SAVED" : "FAILED",
-                  static_cast<unsigned>(skmCycleCaptureRemaining()));
-  }
+  Serial.printf("Deep sleep: %llu s\n", static_cast<unsigned long long>(plan.sleepSeconds));
   Serial.flush();
   delay(20);
   esp_deep_sleep_start();
@@ -1237,362 +668,77 @@ void setup() {
   Serial.begin(115200);
   skmSelectRadioAntenna();
   delay(SKIMMERSENSE_SERIAL_STARTUP_MS);
-
-  const esp_task_wdt_config_t watchdogConfig = {
-      .timeout_ms = SKIMMERSENSE_ACTIVE_WATCHDOG_MS,
-      .idle_core_mask = 0,
-      .trigger_panic = true,
-  };
-  esp_err_t watchdogResult = esp_task_wdt_init(&watchdogConfig);
-  if (watchdogResult == ESP_ERR_INVALID_STATE) {
-    watchdogResult = esp_task_wdt_reconfigure(&watchdogConfig);
-  }
-  if (watchdogResult == ESP_OK) {
-    const esp_err_t subscribeResult = esp_task_wdt_add(nullptr);
-    if (subscribeResult != ESP_OK) {
-      Serial.printf("Active-cycle watchdog subscription: %s\n",
-                    esp_err_to_name(subscribeResult));
-    } else {
-      Serial.printf("Active-cycle watchdog: %lu ms\n",
-                    static_cast<unsigned long>(SKIMMERSENSE_ACTIVE_WATCHDOG_MS));
-    }
-  } else {
-    Serial.printf("Active-cycle watchdog setup failed: %s\n",
-                  esp_err_to_name(watchdogResult));
-  }
-  skmCycleLogBegin();
-  skmCycleLogAppend("Firmware: %s / %s", FIRMWARE_VERSION, FIRMWARE_FLAVOR);
-  skmCycleLogAppend("RF antenna: %s", skmRadioAntennaName());
-
   const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   const uint64_t extMask = currentExt1Mask();
   const LevelState state = loadState(cause);
-
-  Serial.println();
-  Serial.println("========================================");
-  Serial.printf(" SkimmerSense v%s\n", FIRMWARE_VERSION);
-  Serial.printf(" %s\n", FIRMWARE_FLAVOR);
-  Serial.println(" Battery monitoring: MAX17048 enabled");
-  Serial.printf(" RF antenna: %s\n", skmRadioAntennaName());
-  Serial.println(" Zigbee battery percentage: Power Configuration cluster");
-  Serial.println("========================================");
-  printWakeReason();
-  Serial.printf("RTC state: %s\n", stateName(state));
-  skmCycleLogAppend("Wake cause: %s", wakeCauseName(cause));
-  if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-    skmCycleLogAppend("EXT1 wake mask: 0x%llX",
-                      static_cast<unsigned long long>(extMask));
-  }
-  skmCycleLogAppend("RTC state: %s", stateName(state));
-
   SensorSnapshot snapshot = readBaseSensorSnapshot();
-
-  // First decide from floats and wake cause only.
-  // Power the DS18B20 only if this cycle actually needs a fresh
-  // temperature value/report.
   if (state == LevelState::WAIT_HIGH && !snapshot.highClosed) {
     rtcFinalReportPending = true;
     rtcFinalLowClosed = snapshot.lowClosed;
     rtcFinalHighClosed = snapshot.highClosed;
-    Serial.println(
-        "Critical HIGH completion captured in RTC; transmission pending.");
-    skmCycleLogAppend(
-        "Critical HIGH completion captured in RTC; transmission pending");
   }
-
   CyclePlan plan = makePlan(state, snapshot, cause, extMask);
   applyPendingFinalReport(plan);
   const bool temperatureReadRequested = plan.reportTemperature;
-
   if (temperatureReadRequested) {
     readTemperatureIntoSnapshot(snapshot);
     plan = makePlan(state, snapshot, cause, extMask);
     applyPendingFinalReport(plan);
   }
-
-  Serial.printf("Float LOW : %s\n",
-                contactState(snapshot.lowClosed));
-  Serial.printf("Float HIGH: %s\n",
-                contactState(snapshot.highClosed));
-
-  if (temperatureReadRequested) {
-    if (snapshot.temperatureValid) {
-      Serial.printf("Water temperature: %.2f C\n",
-                    snapshot.waterTemperatureC);
-    } else {
-      Serial.println("Water temperature: invalid");
-    }
-  } else {
-    Serial.println("Water temperature: skipped for this wake");
-  }
-
-  if (snapshot.batteryValid) {
-    const BatteryAssessment batteryState = assessBattery(snapshot);
-    const String batteryAlerts = batteryAlertSummary(snapshot);
-    Serial.printf(
-        "MAX17048: VERSION=0x%04X | %.3f V | raw SOC %.1f %% | rounded %u %% | "
-        "rate %s%.2f %%/h | state %s | alerts %s | INT was %s\n",
-        snapshot.maxVersion,
-        snapshot.batteryVoltage,
-        snapshot.batterySocRaw,
-        snapshot.batteryPercent,
-        snapshot.batteryRateValid ? "" : "unavailable / ",
-        snapshot.batteryRateValid ? snapshot.batteryRatePercentPerHour : 0.0f,
-        batteryAssessmentName(batteryState),
-        batteryAlerts.c_str(),
-        snapshot.maxIntLow ? "LOW" : "HIGH");
-  } else {
-    Serial.println("MAX17048: unavailable");
-  }
-
+  Serial.printf("Float LOW : %s\n", contactState(snapshot.lowClosed));
+  Serial.printf("Float HIGH: %s\n", contactState(snapshot.highClosed));
   Serial.printf("Decision: %s\n", plan.reason);
-  skmCycleLogAppend("Floats: LOW=%s HIGH=%s",
-                    contactState(snapshot.lowClosed),
-                    contactState(snapshot.highClosed));
-  if (snapshot.temperatureValid) {
-    skmCycleLogAppend("Water temperature: %.2f C",
-                      snapshot.waterTemperatureC);
-  } else if (temperatureReadRequested) {
-    skmCycleLogAppend("Water temperature: invalid");
-  } else {
-    skmCycleLogAppend("Water temperature: skipped for this wake");
-  }
-  if (snapshot.batteryValid) {
-    const BatteryAssessment batteryState = assessBattery(snapshot);
-    const String batteryAlerts = batteryAlertSummary(snapshot);
-    if (snapshot.batteryRateValid) {
-      skmCycleLogAppend(
-          "MAX17048: %.3f V / raw SOC %.1f %% / rounded %u %% / "
-          "rate %+.2f %%/h / state %s / alerts %s / INT %s",
-          snapshot.batteryVoltage,
-          snapshot.batterySocRaw,
-          snapshot.batteryPercent,
-          snapshot.batteryRatePercentPerHour,
-          batteryAssessmentName(batteryState),
-          batteryAlerts.c_str(),
-          snapshot.maxIntLow ? "LOW" : "HIGH");
-    } else {
-      skmCycleLogAppend(
-          "MAX17048: %.3f V / raw SOC %.1f %% / rounded %u %% / "
-          "rate unavailable / state %s / alerts %s / INT %s",
-          snapshot.batteryVoltage,
-          snapshot.batterySocRaw,
-          snapshot.batteryPercent,
-          batteryAssessmentName(batteryState),
-          batteryAlerts.c_str(),
-          snapshot.maxIntLow ? "LOW" : "HIGH");
-    }
-  } else {
-    skmCycleLogAppend("MAX17048: unavailable");
-  }
-  skmCycleLogAppend("Decision: %s", plan.reason);
-
-#ifdef SKIMMERSENSE_PRODUCTION_BUILD
-  if (plan.nextState == LevelState::NORMAL && !snapshot.lowClosed) {
-    if (snapshot.temperatureValid) {
-      Serial.printf("Adaptive NORMAL timer: %llu s for %.2f C\n",
-                    static_cast<unsigned long long>(plan.sleepSeconds),
-                    snapshot.waterTemperatureC);
-    } else if (rtcNormalSleepValid) {
-      Serial.printf(
-          "Adaptive NORMAL timer: %llu s (cached from %.2f C)\n",
-          static_cast<unsigned long long>(plan.sleepSeconds),
-          rtcLastWaterTemperatureC);
-    } else {
-      Serial.printf(
-          "Adaptive NORMAL timer: %llu s (no valid temperature -> fallback)\n",
-          static_cast<unsigned long long>(plan.sleepSeconds));
-    }
-  }
-#endif
-
-
   SensorSnapshot zigbeeSnapshot = snapshot;
   if (rtcFinalReportPending) {
     zigbeeSnapshot.lowClosed = rtcFinalLowClosed;
     zigbeeSnapshot.highClosed = rtcFinalHighClosed;
-    Serial.printf("Pending final snapshot: LOW=%s HIGH=%s\n",
-                  contactState(zigbeeSnapshot.lowClosed),
-                  contactState(zigbeeSnapshot.highClosed));
-    skmCycleLogAppend("Pending final snapshot: LOW=%s HIGH=%s",
-                      contactState(zigbeeSnapshot.lowClosed),
-                      contactState(zigbeeSnapshot.highClosed));
   }
-
-  if (plan.useZigbee) {
-    Serial.println("Preloading Zigbee attributes BEFORE Zigbee.begin()...");
-    if (!configureZigbeeEndpoints(zigbeeSnapshot)) {
-      Serial.println("Preload/configuration FAILED; sleeping without Zigbee.");
-      scheduleZigbeeRecovery(plan, "endpoint configuration failure");
-      plan.useZigbee = false;
-      plan.reportTemperature = false;
-      plan.reportFloats = false;
-    } else if (!startZigbee(cause == ESP_SLEEP_WAKEUP_UNDEFINED)) {
-      scheduleZigbeeRecovery(plan, "startup/reconnection failure");
-      plan.useZigbee = false;
-      plan.reportTemperature = false;
-      plan.reportFloats = false;
-    } else {
-      if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
-        Serial.printf(
-            "Cold-boot Zigbee interview window: %lu ms...\n",
-            static_cast<unsigned long>(
-                SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS));
-        skmCycleLogAppend(
-            "Cold-boot Zigbee interview window: %lu ms",
-            static_cast<unsigned long>(
-                SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS));
-
-        const uint32_t interviewStartedAt = millis();
-        while (millis() - interviewStartedAt <
-               SKIMMERSENSE_COLD_BOOT_INTERVIEW_GRACE_MS) {
-          // The Zigbee stack runs in its own task. Yield here and keep the
-          // active-cycle watchdog fed while interview requests are answered.
-          esp_task_wdt_reset();
-          delay(100);
-        }
-        Serial.println("Cold-boot Zigbee interview window complete.");
-      }
-
-      Serial.printf("Connected; idling %lu ms without runtime attribute writes...\n",
-                    static_cast<unsigned long>(SKIMMERSENSE_ZIGBEE_IDLE_MS));
-      delay(SKIMMERSENSE_ZIGBEE_IDLE_MS);
-
-      // Read the parent entry already learned by the stack. This is a local
-      // diagnostic lookup and does not transmit an extra Zigbee frame.
-      logZigbeeParentReception("before reports");
-
-      bool reportsOk = true;
-      if (plan.reportTemperature && snapshot.temperatureValid) {
-        reportsOk &= sendSafeReport(
-            ZB_EP_TEMPERATURE,
-            ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-            ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-            "temperature");
+  if (plan.useZigbee && configureZigbeeEndpoints(zigbeeSnapshot) && startZigbee(cause == ESP_SLEEP_WAKEUP_UNDEFINED)) {
+    delay(SKIMMERSENSE_ZIGBEE_IDLE_MS);
+    bool reportsOk = true;
+    if (plan.reportTemperature && snapshot.temperatureValid) {
+      reportsOk &= sendSafeReport(ZB_EP_TEMPERATURE,
+                                  ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+                                  ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+                                  "temperature");
+      delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+    }
+    if (plan.reportFault) {
+      reportsOk &= sendSafeReport(ZB_EP_SENSOR_FAULT,
+                                  ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+                                  ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+                                  "sensor-fault");
+      delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
+    }
+    if (plan.reportFloats) {
+      const bool critical = rtcFinalReportPending;
+      const uint8_t copies = critical ? SKIMMERSENSE_CRITICAL_FINAL_REPORT_COPIES : 1U;
+      for (uint8_t copy = 0; copy < copies; ++copy) {
+        reportsOk &= sendSafeReport(ZB_EP_LOW_LEVEL,
+                                    ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+                                    ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+                                    "low-float");
         delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
-      }
-
-      if (plan.reportFloats) {
-        const bool criticalRefillCompletion = rtcFinalReportPending;
-        const uint8_t floatReportCopies =
-            criticalRefillCompletion
-                ? static_cast<uint8_t>(
-                      SKIMMERSENSE_CRITICAL_FINAL_REPORT_COPIES)
-                : 1U;
-
-        if (criticalRefillCompletion) {
-          Serial.printf(
-              "Critical HIGH completion: sending %u LOW/HIGH copies "
-              "before sleep.\n",
-              static_cast<unsigned>(floatReportCopies));
-          skmCycleLogAppend(
-              "Critical HIGH completion: %u LOW/HIGH copies requested",
-              static_cast<unsigned>(floatReportCopies));
-        }
-
-        for (uint8_t copy = 0; copy < floatReportCopies; ++copy) {
-          if (criticalRefillCompletion) {
-            Serial.printf("Critical final-state copy %u/%u...\n",
-                          static_cast<unsigned>(copy + 1U),
-                          static_cast<unsigned>(floatReportCopies));
-            skmCycleLogAppend("Critical final-state copy %u/%u",
-                              static_cast<unsigned>(copy + 1U),
-                              static_cast<unsigned>(floatReportCopies));
-          }
-
-          // LOW first, then HIGH. Home Assistant closes the valve as soon as
-          // HIGH=OFF is received. Repeating both attributes also restores a
-          // coherent final snapshot if an earlier frame was lost.
-          reportsOk &= sendSafeReport(
-              ZB_EP_LOW_LEVEL,
-              ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-              ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
-              "low-float");
-          delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
-          reportsOk &= sendSafeReport(
-              ZB_EP_HIGH_LEVEL,
-              ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-              ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
-              "high-float");
-
-          if (copy + 1U < floatReportCopies) {
-            delay(SKIMMERSENSE_CRITICAL_FINAL_REPORT_GAP_MS);
-          } else {
-            delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
-          }
-        }
-      }
-
-      if (snapshot.batteryValid) {
-        Serial.printf("Battery telemetry: sending %u percentage copies.\n",
-                      static_cast<unsigned>(SKIMMERSENSE_BATTERY_REPORT_COPIES));
-        skmCycleLogAppend(
-            "Battery telemetry: %u percentage copies requested",
-            static_cast<unsigned>(SKIMMERSENSE_BATTERY_REPORT_COPIES));
-
-        for (uint8_t copy = 0;
-             copy < static_cast<uint8_t>(SKIMMERSENSE_BATTERY_REPORT_COPIES);
-             ++copy) {
-          // Report only attributes preloaded before Zigbee.begin(). Runtime
-          // setters previously triggered a ZBOSS assertion on ESP32-C6.
-          reportsOk &= sendSafeReport(
-              ZB_EP_TEMPERATURE,
-              ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-              ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-              "battery-percent");
-
-          if (copy + 1U < SKIMMERSENSE_BATTERY_REPORT_COPIES) {
-            delay(SKIMMERSENSE_BATTERY_REPORT_GAP_MS);
-          } else {
-            delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
-          }
-        }
-      }
-
-      Serial.printf("Post-report confirmation wait: %lu ms...\n",
-                    static_cast<unsigned long>(SKIMMERSENSE_POST_REPORT_WAIT_MS));
-      delay(SKIMMERSENSE_POST_REPORT_WAIT_MS);
-
-      const bool explicitDeliveryFailure =
-          logZigbeeReportConfirmationFailures();
-      logZigbeeParentReception("after reports");
-
-      if (rtcFinalReportPending && reportsOk && !explicitDeliveryFailure) {
-        rtcFinalReportPending = false;
-        Serial.println(
-            "Critical final snapshot accepted by Zigbee stack; "
-            "RTC pending flag cleared.");
-        skmCycleLogAppend(
-            "Critical final snapshot accepted by Zigbee stack; "
-            "RTC pending flag cleared");
-      }
-
-      Serial.printf(
-          "Zigbee cycle survived. Queueing: %s / callback failure: %s\n",
-          reportsOk ? "ALL OK" : "PARTIAL/FAILED",
-          explicitDeliveryFailure ? "DETECTED" : "NONE");
-      skmCycleLogAppend(
-          "Zigbee cycle survived. Queueing: %s / callback failure: %s",
-          reportsOk ? "ALL OK" : "PARTIAL/FAILED",
-          explicitDeliveryFailure ? "DETECTED" : "NONE");
-
-      // Retry early only for a real local queueing error or an explicit
-      // negative callback. An absent callback is expected on this stack.
-      if (!reportsOk || explicitDeliveryFailure) {
-        scheduleZigbeeRecovery(
-            plan,
-            reportsOk ? "explicit delivery callback failure"
-                      : "report queueing failure");
+        reportsOk &= sendSafeReport(ZB_EP_HIGH_LEVEL,
+                                    ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+                                    ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+                                    "high-float");
+        if (copy + 1U < copies) delay(SKIMMERSENSE_CRITICAL_FINAL_REPORT_GAP_MS);
       }
     }
-  } else {
-    Serial.println("Zigbee cycle intentionally skipped for this state transition.");
-    skmCycleLogAppend("Zigbee cycle intentionally skipped");
+    delay(SKIMMERSENSE_POST_REPORT_WAIT_MS);
+    const bool explicitDeliveryFailure = logZigbeeReportConfirmationFailures();
+    if (plan.reportFault && reportsOk && !explicitDeliveryFailure) {
+      rtcFaultReportKnown = true;
+      rtcLastFaultReported = zigbeeSnapshot.lowClosed && !zigbeeSnapshot.highClosed;
+      Serial.printf("Sensor fault state accepted by Zigbee stack: %s\n",
+                    rtcLastFaultReported ? "ON" : "OFF");
+    }
+    if (rtcFinalReportPending && reportsOk && !explicitDeliveryFailure) {
+      rtcFinalReportPending = false;
+    }
   }
-
   enterPlannedSleep(plan);
 }
 
-void loop() {
-  delay(1000);
-}
+void loop() { delay(1000); }
