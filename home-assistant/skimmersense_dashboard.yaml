@@ -1,0 +1,23 @@
+# Lovelace card - SkimmerSense / Remplissage piscine
+# Add this card in a manual YAML card or adapt it to your dashboard.
+
+type: entities
+title: Remplissage piscine
+show_header_toggle: false
+entities:
+  - entity: sensor.etat_niveau_piscine
+    name: État du niveau
+  - entity: sensor.0x10bda3fffe90a960_temperature
+    name: Température de l'eau
+  - entity: binary_sensor.0x10bda3fffe90a960_low_level_11
+    name: Flotteur bas
+  - entity: binary_sensor.0x10bda3fffe90a960_high_level_12
+    name: Flotteur haut
+  - entity: binary_sensor.0x10bda3fffe90a960_sensor_fault_13
+    name: Défaut capteurs
+  - entity: switch.relais6
+    name: Vanne de remplissage
+  - entity: input_boolean.piscine_remplissage_auto
+    name: Remplissage automatique
+  - entity: input_number.piscine_remplissage_duree_max
+    name: Durée maximale
