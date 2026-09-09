@@ -134,10 +134,10 @@ static_assert(SKIMMERSENSE_BATTERY_REPORT_COPIES >= 1U &&
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #ifdef SKIMMERSENSE_PRODUCTION_BUILD
-static constexpr char FIRMWARE_VERSION[] = "0.9.16-production";
+static constexpr char FIRMWARE_VERSION[] = "0.9.15-production";
 static constexpr char FIRMWARE_FLAVOR[] = "Production anti-wave RTC state machine";
 #else
-static constexpr char FIRMWARE_VERSION[] = "0.9.16-antiwave";
+static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";
 static constexpr char FIRMWARE_FLAVOR[] = "Anti-wave RTC state machine test";
 #endif
 
@@ -172,7 +172,6 @@ static constexpr float MAX17048_CRATE_LSB_PERCENT_PER_HOUR = 0.208f;
 static constexpr uint8_t ZB_EP_TEMPERATURE = 10;
 static constexpr uint8_t ZB_EP_LOW_LEVEL = 11;
 static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;
-static constexpr uint8_t ZB_EP_SENSOR_FAULT = 13;
 
 struct ZigbeeReportConfirmation {
   volatile bool expected = false;
@@ -181,20 +180,19 @@ struct ZigbeeReportConfirmation {
   volatile uint8_t tsn = 0;
 };
 
-ZigbeeReportConfirmation zbReportConfirmations[4];
+ZigbeeReportConfirmation zbReportConfirmations[3];
 
 int reportConfirmationIndex(uint8_t endpoint) {
   if (endpoint == ZB_EP_TEMPERATURE) return 0;
   if (endpoint == ZB_EP_LOW_LEVEL) return 1;
   if (endpoint == ZB_EP_HIGH_LEVEL) return 2;
-  if (endpoint == ZB_EP_SENSOR_FAULT) return 3;
   return -1;
 }
 
 const char *reportConfirmationLabel(size_t index) {
   static constexpr const char *LABELS[] = {
-      "temperature", "low-float", "high-float", "sensor-fault"};
-  return index < 4 ? LABELS[index] : "unknown";
+      "temperature", "low-float", "high-float"};
+  return index < 3 ? LABELS[index] : "unknown";
 }
 
 void zigbeeCommandSendStatusCallback(
@@ -228,7 +226,7 @@ void expectZigbeeReportConfirmation(uint8_t endpoint) {
 bool logZigbeeReportConfirmationFailures() {
   bool explicitFailureDetected = false;
 
-  for (size_t index = 0; index < 4; ++index) {
+  for (size_t index = 0; index < 3; ++index) {
     const ZigbeeReportConfirmation &confirmation =
         zbReportConfirmations[index];
     if (!confirmation.expected) continue;
@@ -285,10 +283,6 @@ RTC_DATA_ATTR uint8_t rtcStateRaw = static_cast<uint8_t>(LevelState::NORMAL);
 RTC_DATA_ATTR bool rtcFinalReportPending = false;
 RTC_DATA_ATTR bool rtcFinalLowClosed = false;
 RTC_DATA_ATTR bool rtcFinalHighClosed = false;
-// Last dedicated fault value accepted by the local Zigbee stack. Retained
-// across deep sleep so a coherent GPIO recovery can publish FAULT=OFF
-// immediately without exposing raw float transitions.
-RTC_DATA_ATTR bool rtcSensorFaultReported = false;
 
 // Last valid adaptive NORMAL interval retained across deep sleep.
 // Short event-only wakes can therefore skip the DS18B20 conversion.
@@ -322,7 +316,6 @@ class PreloadBinary : public ZigbeeBinary {
 ZigbeeTempSensor zbTemperature(ZB_EP_TEMPERATURE);
 PreloadBinary zbLowLevel(ZB_EP_LOW_LEVEL);
 PreloadBinary zbHighLevel(ZB_EP_HIGH_LEVEL);
-PreloadBinary zbSensorFault(ZB_EP_SENSOR_FAULT);
 
 struct SensorSnapshot {
   bool lowClosed = false;
@@ -340,7 +333,6 @@ struct SensorSnapshot {
   bool batteryResetDetected = false;
   bool temperatureValid = false;
   float waterTemperatureC = 20.0f;
-  bool sensorFault = false;
 };
 
 struct CyclePlan {
@@ -348,8 +340,6 @@ struct CyclePlan {
   bool useZigbee = false;
   bool reportTemperature = false;
   bool reportFloats = false;
-  bool reportFault = false;
-  bool faultValue = false;
   uint64_t sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
   bool watchLow = false;
   bool watchHigh = false;
@@ -743,17 +733,9 @@ bool configureZigbeeEndpoints(const SensorSnapshot &snapshot) {
   ok &= zbHighLevel.setBinaryInputDescription("High Level");
   ok &= zbHighLevel.preloadBinaryInput(snapshot.highClosed);
 
-  zbSensorFault.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");
-  ok &= zbSensorFault.addBinaryInput();
-  ok &= zbSensorFault.setBinaryInputApplication(
-      BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);
-  ok &= zbSensorFault.setBinaryInputDescription("Sensor Fault");
-  ok &= zbSensorFault.preloadBinaryInput(snapshot.sensorFault);
-
   ok &= Zigbee.addEndpoint(&zbTemperature);
   ok &= Zigbee.addEndpoint(&zbLowLevel);
   ok &= Zigbee.addEndpoint(&zbHighLevel);
-  ok &= Zigbee.addEndpoint(&zbSensorFault);
   return ok;
 }
 
@@ -1000,7 +982,6 @@ LevelState loadState(esp_sleep_wakeup_cause_t cause) {
     rtcFinalReportPending = false;
     rtcFinalLowClosed = false;
     rtcFinalHighClosed = false;
-    rtcSensorFaultReported = false;
     rtcNormalSleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
     rtcLastWaterTemperatureC = 20.0f;
     rtcNormalSleepValid = false;
@@ -1035,14 +1016,12 @@ CyclePlan makePlan(LevelState state,
         plan.nextState = LevelState::NORMAL;
         plan.useZigbee = true;
         plan.reportTemperature = true;
-        plan.reportFloats = false;
-        plan.reportFault = true;
-        plan.faultValue = true;
+        plan.reportFloats = true;
         plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
         plan.watchLow = true;
         plan.watchHigh = true;
         plan.watchMax = true;
-        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish SENSOR FAULT";
+        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish fault state";
       } else if (snapshot.lowClosed) {
         plan.nextState = LevelState::LOW_PENDING;
         plan.sleepSeconds = SKIMMERSENSE_LOW_CONFIRM_SECONDS;
@@ -1082,14 +1061,12 @@ CyclePlan makePlan(LevelState state,
         plan.nextState = LevelState::NORMAL;
         plan.useZigbee = true;
         plan.reportTemperature = true;
-        plan.reportFloats = false;
-        plan.reportFault = true;
-        plan.faultValue = true;
+        plan.reportFloats = true;
         plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;
         plan.watchLow = true;
         plan.watchHigh = true;
         plan.watchMax = true;
-        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN after confirmation -> publish SENSOR FAULT";
+        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN after continuous confirmation -> publish fault state";
       } else {
         plan.nextState = LevelState::WAIT_HIGH;
         plan.useZigbee = true;
@@ -1143,26 +1120,6 @@ CyclePlan makePlan(LevelState state,
     plan.reportFloats = false;
     plan.reason =
         "LOW closed -> confirmation; cold-boot Zigbee heartbeat (temperature only)";
-  }
-
-  // Keep the dedicated fault endpoint synchronized whenever Zigbee is
-  // already active. WAIT_HIGH completion is explicitly not a sensor fault,
-  // even if its captured final snapshot is LOW=CLOSED / HIGH=OPEN.
-  if (plan.useZigbee && !plan.reportFault) {
-    plan.reportFault = true;
-    plan.faultValue = false;
-  }
-
-  // If a previously reported fault becomes coherent on a GPIO wake, clear
-  // the fault immediately. Do not publish raw LOW/HIGH values here: they
-  // remain governed by the anti-wave validation state machine.
-  if (rtcSensorFaultReported && !plan.reportFault && !plan.useZigbee) {
-    plan.useZigbee = true;
-    plan.reportFault = true;
-    plan.faultValue = false;
-    plan.reportTemperature = false;
-    plan.reportFloats = false;
-    plan.reason = "sensor state coherent again -> publish SENSOR FAULT OFF";
   }
 
   // Adaptive periodic NORMAL refresh is used only when the LOW
@@ -1451,7 +1408,6 @@ void setup() {
 
 
   SensorSnapshot zigbeeSnapshot = snapshot;
-  zigbeeSnapshot.sensorFault = plan.faultValue;
   if (rtcFinalReportPending) {
     zigbeeSnapshot.lowClosed = rtcFinalLowClosed;
     zigbeeSnapshot.highClosed = rtcFinalHighClosed;
@@ -1471,13 +1427,11 @@ void setup() {
       plan.useZigbee = false;
       plan.reportTemperature = false;
       plan.reportFloats = false;
-      plan.reportFault = false;
     } else if (!startZigbee(cause == ESP_SLEEP_WAKEUP_UNDEFINED)) {
       scheduleZigbeeRecovery(plan, "startup/reconnection failure");
       plan.useZigbee = false;
       plan.reportTemperature = false;
       plan.reportFloats = false;
-      plan.reportFault = false;
     } else {
       if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
         Serial.printf(
@@ -1515,15 +1469,6 @@ void setup() {
             ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
             ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
             "temperature");
-        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
-      }
-
-      if (plan.reportFault) {
-        reportsOk &= sendSafeReport(
-            ZB_EP_SENSOR_FAULT,
-            ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-            ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
-            "sensor-fault");
         delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);
       }
 
@@ -1611,14 +1556,6 @@ void setup() {
       const bool explicitDeliveryFailure =
           logZigbeeReportConfirmationFailures();
       logZigbeeParentReception("after reports");
-
-      if (plan.reportFault && reportsOk && !explicitDeliveryFailure) {
-        rtcSensorFaultReported = plan.faultValue;
-        Serial.printf("Sensor fault state accepted by Zigbee stack: %s\n",
-                      rtcSensorFaultReported ? "ON" : "OFF");
-        skmCycleLogAppend("Sensor fault state accepted: %s",
-                          rtcSensorFaultReported ? "ON" : "OFF");
-      }
 
       if (rtcFinalReportPending && reportsOk && !explicitDeliveryFailure) {
         rtcFinalReportPending = false;
