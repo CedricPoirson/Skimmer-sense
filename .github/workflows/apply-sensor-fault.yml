@@ -1,0 +1,136 @@
+name: Apply sensor fault endpoint
+
+on:
+  push:
+    branches:
+      - feature/service-mode-ota
+    paths:
+      - ".github/workflows/apply-sensor-fault.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/service-mode-ota
+          fetch-depth: 0
+
+      - name: Apply minimal sensor-fault patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("firmware/src/sleep_main.cpp")
+          s = p.read_text()
+
+          def rep(old, new):
+              global s
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one anchor, found {count}:\n{old}")
+              s = s.replace(old, new, 1)
+
+          rep('static constexpr char FIRMWARE_VERSION[] = "0.9.15-production";',
+              'static constexpr char FIRMWARE_VERSION[] = "0.9.16-production";')
+          rep('static constexpr char FIRMWARE_VERSION[] = "0.9-deepsleep-zigbee-antiwave";',
+              'static constexpr char FIRMWARE_VERSION[] = "0.9.16-antiwave";')
+
+          rep('''static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;''',
+              '''static constexpr uint8_t ZB_EP_HIGH_LEVEL = 12;\nstatic constexpr uint8_t ZB_EP_SENSOR_FAULT = 13;''')
+
+          rep('''ZigbeeReportConfirmation zbReportConfirmations[3];''',
+              '''ZigbeeReportConfirmation zbReportConfirmations[4];''')
+
+          rep('''  if (endpoint == ZB_EP_HIGH_LEVEL) return 2;\n  return -1;''',
+              '''  if (endpoint == ZB_EP_HIGH_LEVEL) return 2;\n  if (endpoint == ZB_EP_SENSOR_FAULT) return 3;\n  return -1;''')
+
+          rep('''  static constexpr const char *LABELS[] = {\n      "temperature", "low-float", "high-float"};\n  return index < 3 ? LABELS[index] : "unknown";''',
+              '''  static constexpr const char *LABELS[] = {\n      "temperature", "low-float", "high-float", "sensor-fault"};\n  return index < 4 ? LABELS[index] : "unknown";''')
+
+          rep('''  for (size_t index = 0; index < 3; ++index) {''',
+              '''  for (size_t index = 0; index < 4; ++index) {''')
+
+          rep('''RTC_DATA_ATTR bool rtcFinalHighClosed = false;''',
+              '''RTC_DATA_ATTR bool rtcFinalHighClosed = false;\n// Last dedicated fault value accepted by the local Zigbee stack. Retained\n// across deep sleep so a coherent GPIO recovery can publish FAULT=OFF\n// immediately without exposing raw float transitions.\nRTC_DATA_ATTR bool rtcSensorFaultReported = false;''')
+
+          rep('''PreloadBinary zbHighLevel(ZB_EP_HIGH_LEVEL);''',
+              '''PreloadBinary zbHighLevel(ZB_EP_HIGH_LEVEL);\nPreloadBinary zbSensorFault(ZB_EP_SENSOR_FAULT);''')
+
+          rep('''  bool temperatureValid = false;\n  float waterTemperatureC = 20.0f;''',
+              '''  bool temperatureValid = false;\n  float waterTemperatureC = 20.0f;\n  bool sensorFault = false;''')
+
+          rep('''  bool reportTemperature = false;\n  bool reportFloats = false;\n  uint64_t sleepSeconds''',
+              '''  bool reportTemperature = false;\n  bool reportFloats = false;\n  bool reportFault = false;\n  bool faultValue = false;\n  uint64_t sleepSeconds''')
+
+          rep('''  ok &= zbHighLevel.preloadBinaryInput(snapshot.highClosed);\n\n  ok &= Zigbee.addEndpoint(&zbTemperature);\n  ok &= Zigbee.addEndpoint(&zbLowLevel);\n  ok &= Zigbee.addEndpoint(&zbHighLevel);\n  return ok;''',
+              '''  ok &= zbHighLevel.preloadBinaryInput(snapshot.highClosed);\n\n  zbSensorFault.setManufacturerAndModel("SkimmerSense", "SkimmerSense-v1");\n  ok &= zbSensorFault.addBinaryInput();\n  ok &= zbSensorFault.setBinaryInputApplication(\n      BINARY_INPUT_APPLICATION_TYPE_SECURITY_OTHER);\n  ok &= zbSensorFault.setBinaryInputDescription("Sensor Fault");\n  ok &= zbSensorFault.preloadBinaryInput(snapshot.sensorFault);\n\n  ok &= Zigbee.addEndpoint(&zbTemperature);\n  ok &= Zigbee.addEndpoint(&zbLowLevel);\n  ok &= Zigbee.addEndpoint(&zbHighLevel);\n  ok &= Zigbee.addEndpoint(&zbSensorFault);\n  return ok;''')
+
+          rep('''    rtcFinalHighClosed = false;\n    rtcNormalSleepSeconds''',
+              '''    rtcFinalHighClosed = false;\n    rtcSensorFaultReported = false;\n    rtcNormalSleepSeconds''')
+
+          # True impossible state in NORMAL: publish dedicated fault only.
+          rep('''        plan.reportTemperature = true;\n        plan.reportFloats = true;\n        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;\n        plan.watchLow = true;\n        plan.watchHigh = true;\n        plan.watchMax = true;\n        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish fault state";''',
+              '''        plan.reportTemperature = true;\n        plan.reportFloats = false;\n        plan.reportFault = true;\n        plan.faultValue = true;\n        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;\n        plan.watchLow = true;\n        plan.watchHigh = true;\n        plan.watchMax = true;\n        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN -> publish SENSOR FAULT";''')
+
+          # Same impossible state after a completed LOW anti-wave confirmation.
+          rep('''        plan.reportTemperature = true;\n        plan.reportFloats = true;\n        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;\n        plan.watchLow = true;\n        plan.watchHigh = true;\n        plan.watchMax = true;\n        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN after continuous confirmation -> publish fault state";''',
+              '''        plan.reportTemperature = true;\n        plan.reportFloats = false;\n        plan.reportFault = true;\n        plan.faultValue = true;\n        plan.sleepSeconds = SKIMMERSENSE_NORMAL_TIMER_SECONDS;\n        plan.watchLow = true;\n        plan.watchHigh = true;\n        plan.watchMax = true;\n        plan.reason = "IMPOSSIBLE LOW=CLOSED HIGH=OPEN after confirmation -> publish SENSOR FAULT";''')
+
+          anchor = '''  // Adaptive periodic NORMAL refresh is used only when the LOW\n  // float is OPEN. Fault states and LOW-confirmation logic keep their\n  // conservative fixed timers. GPIO wake remains immediate.\n'''
+          insertion = '''  // Keep the dedicated fault endpoint synchronized whenever Zigbee is\n  // already active. WAIT_HIGH completion is explicitly not a sensor fault,\n  // even if its captured final snapshot is LOW=CLOSED / HIGH=OPEN.\n  if (plan.useZigbee && !plan.reportFault) {\n    plan.reportFault = true;\n    plan.faultValue = false;\n  }\n\n  // If a previously reported fault becomes coherent on a GPIO wake, clear\n  // the fault immediately. Do not publish raw LOW/HIGH values here: they\n  // remain governed by the anti-wave validation state machine.\n  if (rtcSensorFaultReported && !plan.reportFault && !plan.useZigbee) {\n    plan.useZigbee = true;\n    plan.reportFault = true;\n    plan.faultValue = false;\n    plan.reportTemperature = false;\n    plan.reportFloats = false;\n    plan.reason = "sensor state coherent again -> publish SENSOR FAULT OFF";\n  }\n\n''' + anchor
+          rep(anchor, insertion)
+
+          rep('''  SensorSnapshot zigbeeSnapshot = snapshot;\n  if (rtcFinalReportPending) {''',
+              '''  SensorSnapshot zigbeeSnapshot = snapshot;\n  zigbeeSnapshot.sensorFault = plan.faultValue;\n  if (rtcFinalReportPending) {''')
+
+          # Clear the new report flag on either pre-Zigbee failure path.
+          old = '''      plan.reportTemperature = false;\n      plan.reportFloats = false;'''
+          if s.count(old) != 2:
+              raise SystemExit(f"Expected two Zigbee failure cleanup anchors, found {s.count(old)}")
+          s = s.replace(old,
+                        '''      plan.reportTemperature = false;\n      plan.reportFloats = false;\n      plan.reportFault = false;''',
+                        2)
+
+          anchor = '''      if (plan.reportFloats) {\n'''
+          insertion = '''      if (plan.reportFault) {\n        reportsOk &= sendSafeReport(\n            ZB_EP_SENSOR_FAULT,\n            ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,\n            ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,\n            "sensor-fault");\n        delay(SKIMMERSENSE_BETWEEN_REPORTS_MS);\n      }\n\n''' + anchor
+          rep(anchor, insertion)
+
+          anchor = '''      if (rtcFinalReportPending && reportsOk && !explicitDeliveryFailure) {\n'''
+          insertion = '''      if (plan.reportFault && reportsOk && !explicitDeliveryFailure) {\n        rtcSensorFaultReported = plan.faultValue;\n        Serial.printf("Sensor fault state accepted by Zigbee stack: %s\\n",\n                      rtcSensorFaultReported ? "ON" : "OFF");\n        skmCycleLogAppend("Sensor fault state accepted: %s",\n                          rtcSensorFaultReported ? "ON" : "OFF");\n      }\n\n''' + anchor
+          rep(anchor, insertion)
+
+          p.write_text(s)
+          print("Patched sleep_main.cpp minimally for dedicated Sensor Fault EP13")
+          PY
+
+      - name: Verify patch whitespace
+        run: git diff --check
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade platformio
+
+      - name: Build anti-wave test profile
+        run: pio run -d firmware -e seeed_xiao_esp32c6_sleep_zigbee_antiwave
+
+      - name: Build production profile
+        run: |
+          cp firmware/include/wifi_secrets.example.h firmware/include/wifi_secrets.h
+          pio run -d firmware -e seeed_xiao_esp32c6_sleep_zigbee_production
+
+      - name: Commit validated patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firmware/src/sleep_main.cpp
+          git commit -m "Add dedicated Zigbee sensor fault endpoint"
+          git push origin HEAD:feature/service-mode-ota
