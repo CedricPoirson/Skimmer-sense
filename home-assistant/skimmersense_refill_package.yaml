@@ -1,0 +1,222 @@
+# SkimmerSense - Home Assistant refill package
+#
+# Safe defaults:
+# - automatic refill is disabled by default
+# - the valve is forced OFF on HIGH completion, sensor fault, unavailable float
+#   entities, Home Assistant restart, or maximum-open timeout
+# - the firmware already performs the 5-minute anti-wave LOW confirmation
+#
+# IMPORTANT: verify the Sensor Fault entity id created by Zigbee2MQTT after
+# interviewing firmware v0.9.16. The expected id is:
+#   binary_sensor.0x10bda3fffe90a960_sensor_fault_13
+# If Zigbee2MQTT chose another id, replace it everywhere below before enabling
+# automatic refill.
+
+input_boolean:
+  piscine_remplissage_auto:
+    name: Remplissage automatique piscine
+    icon: mdi:water-sync
+    initial: false
+
+input_number:
+  piscine_remplissage_duree_max:
+    name: Durée maximale remplissage piscine
+    icon: mdi:timer-alert-outline
+    min: 5
+    max: 180
+    step: 5
+    unit_of_measurement: min
+    mode: slider
+    initial: 30
+
+template:
+  - sensor:
+      - name: "État niveau piscine"
+        unique_id: etat_niveau_piscine
+        state: >
+          {% set low = states('binary_sensor.0x10bda3fffe90a960_low_level_11') %}
+          {% set high = states('binary_sensor.0x10bda3fffe90a960_high_level_12') %}
+          {% set fault = states('binary_sensor.0x10bda3fffe90a960_sensor_fault_13') %}
+          {% set valve = is_state('switch.relais6', 'on') %}
+          {% if low not in ['on', 'off'] or high not in ['on', 'off'] %}
+            Indisponible
+          {% elif fault == 'on' or (low == 'on' and high == 'off') %}
+            Défaut flotteurs
+          {% elif valve %}
+            Remplissage
+          {% elif low == 'on' and high == 'on' %}
+            Niveau bas validé
+          {% elif low == 'off' and high == 'on' %}
+            Niveau intermédiaire
+          {% else %}
+            Niveau haut
+          {% endif %}
+        icon: >
+          {% set low = states('binary_sensor.0x10bda3fffe90a960_low_level_11') %}
+          {% set high = states('binary_sensor.0x10bda3fffe90a960_high_level_12') %}
+          {% set fault = states('binary_sensor.0x10bda3fffe90a960_sensor_fault_13') %}
+          {% if low not in ['on', 'off'] or high not in ['on', 'off'] %}
+            mdi:water-alert
+          {% elif fault == 'on' or (low == 'on' and high == 'off') %}
+            mdi:alert-octagon
+          {% elif is_state('switch.relais6', 'on') %}
+            mdi:water-pump
+          {% elif low == 'on' and high == 'on' %}
+            mdi:waves-arrow-down
+          {% elif low == 'off' and high == 'on' %}
+            mdi:waves
+          {% else %}
+            mdi:waves-arrow-up
+          {% endif %}
+
+  - binary_sensor:
+      - name: "SkimmerSense prêt au remplissage"
+        unique_id: skimmersense_pret_remplissage
+        state: >
+          {{ is_state('binary_sensor.0x10bda3fffe90a960_low_level_11', 'on')
+             and is_state('binary_sensor.0x10bda3fffe90a960_high_level_12', 'on')
+             and not is_state('binary_sensor.0x10bda3fffe90a960_sensor_fault_13', 'on') }}
+        availability: >
+          {{ states('binary_sensor.0x10bda3fffe90a960_low_level_11') in ['on','off']
+             and states('binary_sensor.0x10bda3fffe90a960_high_level_12') in ['on','off']
+             and states('binary_sensor.0x10bda3fffe90a960_sensor_fault_13') in ['on','off'] }}
+        icon: mdi:water-check
+
+automation:
+  - id: piscine_remplissage_demarrage_auto
+    alias: "Piscine - Démarrer remplissage automatique"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.skimmersense_pret_au_remplissage
+        to: "on"
+      - platform: state
+        entity_id: input_boolean.piscine_remplissage_auto
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.piscine_remplissage_auto
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.skimmersense_pret_au_remplissage
+        state: "on"
+      - condition: state
+        entity_id: switch.relais6
+        state: "off"
+    action:
+      - service: switch.turn_on
+        target:
+          entity_id: switch.relais6
+      - service: notify.iphone_cedric3
+        data:
+          title: "Piscine"
+          message: "Remplissage automatique démarré : niveau bas validé par SkimmerSense."
+
+  - id: piscine_remplissage_arret_niveau_haut
+    alias: "Piscine - Arrêter remplissage au niveau haut"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.0x10bda3fffe90a960_high_level_12
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: switch.relais6
+        state: "on"
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.relais6
+      - service: notify.iphone_cedric3
+        data:
+          title: "Piscine"
+          message: "Remplissage terminé : niveau haut atteint."
+
+  - id: piscine_remplissage_securite_capteurs
+    alias: "Piscine - Sécurité capteurs remplissage"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.0x10bda3fffe90a960_sensor_fault_13
+        to: "on"
+      - platform: template
+        value_template: >
+          {{ is_state('binary_sensor.0x10bda3fffe90a960_low_level_11', 'on')
+             and is_state('binary_sensor.0x10bda3fffe90a960_high_level_12', 'off') }}
+      - platform: template
+        value_template: >
+          {{ states('binary_sensor.0x10bda3fffe90a960_low_level_11') not in ['on','off']
+             or states('binary_sensor.0x10bda3fffe90a960_high_level_12') not in ['on','off']
+             or states('binary_sensor.0x10bda3fffe90a960_sensor_fault_13') not in ['on','off'] }}
+    condition:
+      - condition: state
+        entity_id: switch.relais6
+        state: "on"
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.relais6
+      - parallel:
+          - service: notify.iphone_cedric3
+            data:
+              title: "ALERTE piscine"
+              message: "Remplissage coupé par sécurité : défaut ou indisponibilité des capteurs SkimmerSense."
+          - service: notify.iphone_de_magali
+            data:
+              title: "ALERTE piscine"
+              message: "Remplissage coupé par sécurité : défaut ou indisponibilité des capteurs SkimmerSense."
+
+  - id: piscine_remplissage_timeout
+    alias: "Piscine - Timeout remplissage"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: switch.relais6
+        to: "on"
+    action:
+      - delay:
+          minutes: "{{ states('input_number.piscine_remplissage_duree_max') | int(30) }}"
+      - condition: state
+        entity_id: switch.relais6
+        state: "on"
+      - service: switch.turn_off
+        target:
+          entity_id: switch.relais6
+      - parallel:
+          - service: notify.iphone_cedric3
+            data:
+              title: "ALERTE piscine"
+              message: >
+                Remplissage coupé après {{ states('input_number.piscine_remplissage_duree_max') | int }} min : délai maximal atteint.
+          - service: notify.iphone_de_magali
+            data:
+              title: "ALERTE piscine"
+              message: >
+                Remplissage coupé après {{ states('input_number.piscine_remplissage_duree_max') | int }} min : délai maximal atteint.
+
+  - id: piscine_remplissage_arret_si_auto_desactive
+    alias: "Piscine - Arrêter si remplissage auto désactivé"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.piscine_remplissage_auto
+        to: "off"
+    condition:
+      - condition: state
+        entity_id: switch.relais6
+        state: "on"
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.relais6
+
+  - id: piscine_remplissage_arret_redemarrage_ha
+    alias: "Piscine - Sécurité redémarrage Home Assistant"
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.relais6
