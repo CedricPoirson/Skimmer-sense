@@ -84,25 +84,13 @@ automation:
     alias: "Piscine - Démarrer remplissage automatique"
     mode: single
     trigger:
-      - platform: state
-        entity_id: binary_sensor.0x10bda3fffe90a960_low_level_11
-        to: "on"
-      - platform: state
-        entity_id: input_boolean.piscine_remplissage_auto
-        to: "on"
+      - platform: template
+        value_template: >
+          {{ is_state('input_boolean.piscine_remplissage_auto', 'on')
+             and is_state('binary_sensor.0x10bda3fffe90a960_low_level_11', 'on')
+             and is_state('binary_sensor.0x10bda3fffe90a960_high_level_12', 'on')
+             and is_state('binary_sensor.0x10bda3fffe90a960_sensor_fault_13', 'off') }}
     condition:
-      - condition: state
-        entity_id: input_boolean.piscine_remplissage_auto
-        state: "on"
-      - condition: state
-        entity_id: binary_sensor.0x10bda3fffe90a960_low_level_11
-        state: "on"
-      - condition: state
-        entity_id: binary_sensor.0x10bda3fffe90a960_high_level_12
-        state: "on"
-      - condition: state
-        entity_id: binary_sensor.0x10bda3fffe90a960_sensor_fault_13
-        state: "off"
       - condition: state
         entity_id: switch.relais6
         state: "off"
@@ -111,6 +99,7 @@ automation:
         target:
           entity_id: switch.relais6
       - service: notify.iphone_cedric3
+        continue_on_error: true
         data:
           title: "Piscine"
           message: "Remplissage automatique démarré : niveau bas validé par SkimmerSense."
@@ -131,6 +120,7 @@ automation:
         target:
           entity_id: switch.relais6
       - service: notify.iphone_cedric3
+        continue_on_error: true
         data:
           title: "Piscine"
           message: "Remplissage terminé : niveau haut atteint."
